@@ -37,7 +37,7 @@ async def cmd_help(message: Message):
 async def cmd_subscribe(message: Message):
     """Оформление подписки через TG Stars."""
     # TODO: app/payments/tg_stars.py — отправка invoice
-    await message.answer("⏳ Подписки скоро будут\\. Сейчас триал на 7 дней")
+    await message.answer("⏳ Подписки скоро будут. Сейчас 5 решений бесплатно.")
 
 
 @router.message(F.photo)
@@ -70,7 +70,7 @@ async def handle_photo(message: Message, bot: Bot):
             user_id=user_id,
             user_hint=caption,
         )
-        await processing_msg.edit_text(solution, parse_mode="MarkdownV2")
+        await processing_msg.edit_text(solution, parse_mode="HTML")
     except Exception as e:
         logger.exception(f"Pipeline error for user {user_id}: {e}")
         await processing_msg.edit_text(MSG_ERROR)
@@ -80,6 +80,6 @@ async def handle_photo(message: Message, bot: Bot):
 async def handle_text(message: Message):
     """Текстовые сообщения — пока подсказка кинуть фото."""
     await message.answer(
-        "📸 Кинь *фото* задачи — решу пошагово\\.\n"
+        "📸 Кинь <b>фото</b> задачи — решу пошагово.\n"
         "Команды: /help, /subscribe"
     )

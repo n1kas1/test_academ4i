@@ -24,7 +24,7 @@ from app.core.redis import close_redis, init_redis
 # === Aiogram setup ===
 bot = Bot(
     token=settings.telegram_bot_token,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
 dp.include_router(handlers.router)
