@@ -53,6 +53,12 @@ LATEX_TTL_SECONDS = 3600
 
 # ─────────────────────── команды ───────────────────────
 
+async def _menu_kb(user_id: int, username: str | None):
+    """Меню с учётом текущего статуса юзера (Premium/admin → без кнопок покупки)."""
+    quota = await check_quota(user_id, username=username)
+    return main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin), quota
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     user = message.from_user
@@ -62,18 +68,23 @@ async def cmd_start(message: Message):
         first_name=user.first_name, last_name=user.last_name,
         language_code=user.language_code,
     )
+    kb, _ = await _menu_kb(user.id, user.username)
     prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
-    await message.answer(prefix + MSG_START, reply_markup=main_menu_keyboard())
+    await message.answer(prefix + MSG_START, reply_markup=kb)
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
-    await message.answer("Главное меню 👇", reply_markup=main_menu_keyboard())
+    user = message.from_user
+    kb, _ = await _menu_kb(user.id, user.username)
+    await message.answer("Главное меню 👇", reply_markup=kb)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(MSG_HELP, reply_markup=main_menu_keyboard())
+    user = message.from_user
+    kb, _ = await _menu_kb(user.id, user.username)
+    await message.answer(MSG_HELP, reply_markup=kb)
 
 
 @router.message(Command("balance"))
@@ -105,6 +116,16 @@ async def menu_buy_pack(message: Message, bot: Bot):
     if is_admin(user.username):
         await message.answer("👑 У тебя безлимит как у админа — покупки не нужны.")
         return
+    quota = await check_quota(user.id, username=user.username)
+    if quota.is_premium:
+        until_str = quota.premium_until.strftime("%d.%m.%Y") if quota.premium_until else ""
+        kb = main_menu_keyboard(is_premium=True)
+        await message.answer(
+            f"💎 У тебя активен Premium до <b>{until_str}</b> — безлимит решений.\n"
+            f"Дополнительные пакеты не нужны.",
+            reply_markup=kb,
+        )
+        return
     await message.answer(MSG_BUY_PACK_PROMPT)
     await send_pack_invoice(bot, chat_id=message.chat.id)
 
@@ -122,10 +143,13 @@ async def _start_premium_purchase(message: Message, bot: Bot):
     quota = await check_quota(user.id, username=user.username)
     if quota.is_premium:
         until_str = quota.premium_until.strftime("%d.%m.%Y") if quota.premium_until else ""
+        kb = main_menu_keyboard(is_premium=True)
         await message.answer(
             f"💎 Premium уже активен до <b>{until_str}</b>.\n"
-            f"Оплата продлит ещё на 30 дней."
+            f"Продлить можно после окончания срока.",
+            reply_markup=kb,
         )
+        return
     await message.answer(MSG_BUY_PREMIUM_PROMPT)
     await send_premium_invoice(bot, chat_id=message.chat.id)
 
@@ -137,7 +161,8 @@ async def _send_balance(message: Message):
         first_name=user.first_name, last_name=user.last_name,
     )
     quota = await check_quota(user.id, username=user.username)
-    await message.answer(msg_balance(quota), reply_markup=main_menu_keyboard())
+    kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
+    await message.answer(msg_balance(quota), reply_markup=kb)
 
 
 # ─────────────────────── фото → решение ───────────────────────
@@ -160,7 +185,8 @@ async def handle_photo(message: Message, bot: Bot):
 
     quota = await check_quota(user_id, username=username)
     if not quota.allowed:
-        await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=main_menu_keyboard())
+        kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
+        await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
         return
 
     photo = message.photo[-1]
@@ -253,10 +279,12 @@ async def handle_show_latex(callback: CallbackQuery):
 @router.message(F.text)
 async def handle_text(message: Message):
     """Любой текст не из меню — подсказка."""
+    user = message.from_user
+    kb, _ = await _menu_kb(user.id, user.username)
     await message.answer(
         "📸 Кинь <b>фото</b> задачи — решу пошагово.\n"
         "Или выбери из меню под клавиатурой 👇",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=kb,
     )
 
 

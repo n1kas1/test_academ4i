@@ -41,13 +41,20 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_redis()
 
-    # Зарегистрировать webhook в TG
-    await bot.set_webhook(
-        url=settings.webhook_url,
-        secret_token=settings.telegram_webhook_secret,
-        drop_pending_updates=True,
-    )
-    logger.info(f"Webhook set: {settings.webhook_url}")
+    # Зарегистрировать webhook в TG. НЕ блокируем старт если упало —
+    # обычно webhook уже установлен у Telegram, переустановка не критична.
+    try:
+        await bot.set_webhook(
+            url=settings.webhook_url,
+            secret_token=settings.telegram_webhook_secret,
+            drop_pending_updates=True,
+        )
+        logger.info(f"Webhook set: {settings.webhook_url}")
+    except Exception as e:
+        logger.warning(
+            f"set_webhook failed (non-fatal — likely DNS lag): {e}. "
+            f"App continues; reinstall webhook later if needed."
+        )
 
     yield
 

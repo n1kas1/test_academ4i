@@ -12,9 +12,10 @@ from aiogram.types import (
 from loguru import logger
 from sqlalchemy import text
 
+from app.bot.keyboards import main_menu_keyboard
 from app.config import settings
 from app.core.db import get_session
-from app.ratelimit import activate_premium, add_credits
+from app.ratelimit import activate_premium, add_credits, is_admin
 
 router = Router()
 
@@ -129,4 +130,11 @@ async def on_successful_payment(message: Message):
     except Exception as e:
         logger.exception(f"payment log failed (non-fatal): {e}")
 
-    await message.answer(result_text)
+    # После Premium-покупки обновляем клавиатуру (без кнопок покупки).
+    # После пакета — оставляем обычное меню (юзер может ещё купить).
+    is_premium_now = payload == PAYLOAD_PREMIUM
+    kb = main_menu_keyboard(
+        is_premium=is_premium_now,
+        is_admin=is_admin(message.from_user.username),
+    )
+    await message.answer(result_text, reply_markup=kb)
