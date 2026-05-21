@@ -6,6 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     curl \
     poppler-utils \
+    # TeX Live для LaTeX → PDF → PNG рендера решений
+    texlive-latex-base \
+    texlive-latex-recommended \
+    texlive-latex-extra \
+    texlive-fonts-recommended \
+    texlive-lang-cyrillic \
+    texlive-science \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

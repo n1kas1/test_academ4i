@@ -30,12 +30,15 @@
         ↓
     return solution
 """
+import re
+
 from loguru import logger
 
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
+from app.render.latex_to_png import render_latex_to_png
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
 RAG_MIN_SIMILARITY = 0.65
@@ -43,12 +46,30 @@ RAG_TOP_K = 5
 RAG_USE_TOP = 3
 
 
+# Очистка от возможной markdown-обёртки ```latex ... ```
+_FENCE_RE = re.compile(r"^```(?:latex|tex|math)?\s*\n?|\n?```\s*$", re.IGNORECASE)
+
+
+def _clean_latex(text: str) -> str:
+    """Снимает code-fence обёртку если Claude её добавил."""
+    text = text.strip()
+    text = _FENCE_RE.sub("", text)
+    return text.strip()
+
+
 async def solve_task_from_photo(
     photo_bytes: bytes,
     user_id: int,
     user_hint: str = "",
-) -> str:
-    """Главная точка входа из bot/handlers.py."""
+) -> dict:
+    """Главная точка входа из bot/handlers.py.
+
+    Возвращает dict:
+      {
+        "latex": "...",          # сырой LaTeX от Claude (для копирования юзером)
+        "png": bytes | None,     # PNG-картинка решения (или None если рендер упал)
+      }
+    """
     logger.info(f"Pipeline start for user {user_id}")
 
     # 1) Подготовка фото
@@ -60,12 +81,15 @@ async def solve_task_from_photo(
     # 3) Если OCR провалился — fallback в простой vision-call без RAG
     if not condition_text or len(condition_text) < 20:
         logger.warning(f"OCR failed/short for user {user_id}, fallback no-RAG")
-        return await solve_with_claude_vision(
+        latex_raw = await solve_with_claude_vision(
             image_b64=image_b64,
             media_type=media_type,
             user_hint=user_hint,
             rag_context="",
         )
+        latex_clean = _clean_latex(latex_raw)
+        png = await render_latex_to_png(latex_clean)
+        return {"latex": latex_clean, "png": png}
 
     # 4) Классификация темы (для фильтрации retrieval)
     topic = classify_topic(condition_text)
@@ -99,7 +123,10 @@ async def solve_task_from_photo(
             await increment_usage(hit["id"])
         except Exception as e:
             logger.warning(f"increment_usage failed: {e}")
-        return hit["solution_markdown"]
+        # В solution_markdown лежит LaTeX (наш generated кэш). Рендерим (с кэшем PNG).
+        cached_latex = _clean_latex(hit["solution_markdown"])
+        png = await render_latex_to_png(cached_latex)
+        return {"latex": cached_latex, "png": png}
 
     # 7) Cache miss — собираем RAG-контекст и решаем через Claude
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
@@ -109,30 +136,34 @@ async def solve_task_from_photo(
     use_thinking = is_complex_task(condition_text)
     logger.info(f"Router decision: complex={use_thinking}")
 
-    solution = await solve_with_claude_vision(
+    solution_raw = await solve_with_claude_vision(
         image_b64=image_b64,
         media_type=media_type,
         user_hint=user_hint,
         rag_context=rag_context,
         use_thinking=use_thinking,
     )
+    latex_clean = _clean_latex(solution_raw)
 
-    # 8) Сохраняем в кэш для будущих юзеров
+    # 8) Сохраняем LaTeX в кэш для будущих юзеров
     try:
         await save_solution(
             task_text=condition_text,
             task_latex=None,
             embedding=embedding,
             topic=topic,
-            solution_markdown=solution,
+            solution_markdown=latex_clean,
             source="generated",
             generated_for_user=user_id,
         )
     except Exception as e:
         logger.warning(f"save_solution failed (non-fatal): {e}")
 
-    logger.info(f"Pipeline done for user {user_id}: {len(solution)} chars")
-    return solution
+    # 9) Рендер PNG (с кэшем по hash содержимого)
+    png = await render_latex_to_png(latex_clean)
+
+    logger.info(f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, png={'OK' if png else 'FAIL'}")
+    return {"latex": latex_clean, "png": png}
 
 
 def is_complex_task(task_text: str) -> bool:
