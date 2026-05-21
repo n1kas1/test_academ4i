@@ -17,6 +17,10 @@ from loguru import logger
 CACHE_DIR = Path("/app/render_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
+# Это инвалидирует все старые PNG-кэши автоматически.
+TEMPLATE_VERSION = "v2"
+
 # Шаблон: широкая страница 18см, большой запас по высоте, потом обрезаем pdfcrop.
 LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[utf8]{inputenc}
@@ -69,7 +73,9 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 
 
 def _content_hash(latex: str) -> str:
-    return hashlib.sha256(latex.encode("utf-8")).hexdigest()[:16]
+    """Хэш зависит от версии шаблона — изменение шаблона инвалидирует все кэши."""
+    key = f"{TEMPLATE_VERSION}:{latex}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def _compile_sync(latex_content: str, out_png: Path) -> bool:
