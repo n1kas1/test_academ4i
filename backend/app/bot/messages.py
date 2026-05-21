@@ -1,13 +1,16 @@
 """Все тексты сообщений бота. HTML parse_mode."""
+from app.config import settings
+
 
 MSG_START = (
     "👋 Привет! Я <b>Academ4I</b> — решаю задачи по матану, линалу и алгебре.\n\n"
-    "📸 Кинь <b>фото задачи</b> — получишь пошаговое решение в виде PDF-картинки + LaTeX-код.\n\n"
-    "🎁 <b>3 решения бесплатно</b>, дальше — <b>399₽/мес безлимит</b>.\n\n"
+    "📸 Кинь <b>фото задачи</b> — получишь решение в виде PDF-картинки + LaTeX-код.\n\n"
+    f"🎁 <b>{settings.free_lifetime_tasks} решения бесплатно</b>, дальше — Premium или пакеты "
+    "(см. меню под клавиатурой 👇).\n\n"
     "Команды:\n"
     "/help — что я умею\n"
-    "/balance — сколько бесплатных задач осталось\n"
-    "/subscribe — оформить Premium"
+    "/balance — сколько решений осталось\n"
+    "/menu — вернуть меню"
 )
 
 MSG_HELP = (
@@ -19,18 +22,21 @@ MSG_HELP = (
     "📸 <b>Как пользоваться:</b>\n"
     "Кидай фото задачи. Если на фото несколько задач — в подписи к фото "
     "укажи номер и подзадачу, например: <i>«реши 2851 а)»</i>.\n\n"
-    "💎 <b>Тарифы:</b>\n"
-    "• Free — 3 решения (попробовать)\n"
-    "• Premium — 399₽/мес безлимит\n\n"
+    f"💎 <b>Тарифы:</b>\n"
+    f"• Free — <b>{settings.free_lifetime_tasks} решения</b> (попробовать)\n"
+    f"• Пакет — <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> (без срока)\n"
+    f"• Premium — <b>30 дней безлимит за {settings.premium_price_stars}⭐</b>\n\n"
     "Поддержка: @Academ4I_support"
 )
 
 MSG_PROCESSING = "🧠 Решаю..."
 
 MSG_QUOTA_EXCEEDED = (
-    "⛔ Бесплатные <b>3 решения</b> закончились.\n\n"
-    "Хочешь продолжить — оформи <b>Premium 399₽/мес</b>, безлимит решений и приоритет.\n\n"
-    "/subscribe — оформить"
+    f"⛔ Бесплатные <b>{settings.free_lifetime_tasks} решения</b> закончились.\n\n"
+    "Хочешь продолжить — выбери в меню 👇:\n"
+    f"• 🎁 <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> "
+    "(разово, без срока)\n"
+    f"• 💎 <b>Premium {settings.premium_price_stars}⭐</b> — безлимит на 30 дней"
 )
 
 MSG_ERROR = (
@@ -39,37 +45,50 @@ MSG_ERROR = (
 )
 
 
-def msg_balance(free_remaining: int, free_limit: int, is_premium: bool, premium_until: str | None) -> str:
-    if is_premium:
+def msg_balance(quota) -> str:
+    """quota — QuotaResult. Текст с балансом юзера."""
+    if quota.is_admin:
+        return "👑 <b>Админ-аккаунт</b> — безлимит решений."
+
+    if quota.is_premium:
+        until = quota.premium_until.strftime("%d.%m.%Y %H:%M UTC") if quota.premium_until else ""
+        extra = ""
+        if quota.credits > 0:
+            extra = f"\n🎁 Пакетных задач сверху: <b>{quota.credits}</b>"
         return (
             f"💎 <b>Premium активен</b>\n"
-            f"Безлимит решений до: <b>{premium_until}</b>"
+            f"Безлимит до: <b>{until}</b>{extra}"
         )
-    return (
-        f"🎁 Бесплатных решений осталось: <b>{free_remaining}/{free_limit}</b>\n\n"
-        f"Когда закончатся — /subscribe для Premium (399₽/мес безлимит)."
+
+    lines = ["📊 <b>Твой баланс</b>", ""]
+    if quota.credits > 0:
+        lines.append(f"🎁 Купленных задач: <b>{quota.credits}</b>")
+    lines.append(
+        f"🆓 Бесплатных осталось: <b>{quota.free_remaining}/{settings.free_lifetime_tasks}</b>"
     )
+    if quota.total_remaining == 0:
+        lines.append("")
+        lines.append("Чтобы продолжить — выбери в меню пакет или Premium 👇")
+    return "\n".join(lines)
 
-
-def msg_subscribe_prompt() -> str:
-    return (
-        "💎 <b>Premium Academ4I</b>\n\n"
-        "✓ Безлимит решений на 30 дней\n"
-        "✓ Все предметы: матан, линал, алгебра, группы\n"
-        "✓ Приоритетная обработка\n\n"
-        "Цена: <b>~399₽</b> (Telegram конвертирует в Stars автоматически)\n\n"
-        "Жми кнопку ниже для оплаты:"
-    )
-
-
-MSG_PAYMENT_SUCCESS = (
-    "✅ <b>Premium активирован!</b>\n\n"
-    "Действует <b>30 дней</b>, безлимит решений.\n\n"
-    "Кидай фото задачи — решу. Удачи в сессии 🎓"
-)
 
 MSG_ADMIN_WELCOME = (
-    "👑 <b>Привет, админ!</b>\n\n"
-    "У тебя безлимит решений.\n"
-    "Команды доступны как обычно."
+    "👑 <b>Привет, админ!</b> Безлимит решений включён.\n\n"
+)
+
+
+MSG_BUY_PACK_PROMPT = (
+    f"🎁 <b>Пакет {settings.pack_tasks} задач</b>\n\n"
+    f"✓ {settings.pack_tasks} решений сверх бесплатных\n"
+    f"✓ Без срока — используй когда угодно\n"
+    f"✓ Цена: <b>{settings.pack_price_stars}⭐</b>\n\n"
+    f"Жми кнопку оплаты ниже 👇"
+)
+
+MSG_BUY_PREMIUM_PROMPT = (
+    f"💎 <b>Premium на 30 дней</b>\n\n"
+    f"✓ Безлимит решений\n"
+    f"✓ Все темы: матан, линал, алгебра, группы\n"
+    f"✓ Цена: <b>{settings.premium_price_stars}⭐</b>\n\n"
+    f"Жми кнопку оплаты ниже 👇"
 )

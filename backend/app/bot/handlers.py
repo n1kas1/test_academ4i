@@ -1,10 +1,9 @@
 """Telegram bot handlers.
 
-Главный flow:
-  /start — регистрация
-  фото → проверка квоты → pipeline → PNG + LaTeX-кнопка → consume_quota
-  /balance — статус
-  /subscribe — TG Stars invoice
+Routing:
+  /start, /menu — главное меню (reply-keyboard под клавиатурой)
+  фото → check_quota → pipeline → PNG + LaTeX button → consume_quota
+  Кнопки меню (BTN_*) — переход на покупку или /balance / /help
 """
 import secrets
 
@@ -18,20 +17,28 @@ from aiogram.types import (
 from loguru import logger
 
 from app.ai.pipeline import solve_task_from_photo
-from app.bot.keyboards import latex_view_keyboard
+from app.bot.keyboards import (
+    BTN_BALANCE,
+    BTN_BUY_PACK,
+    BTN_BUY_PREMIUM,
+    BTN_HELP,
+    latex_view_keyboard,
+    main_menu_keyboard,
+)
 from app.bot.messages import (
     MSG_ADMIN_WELCOME,
+    MSG_BUY_PACK_PROMPT,
+    MSG_BUY_PREMIUM_PROMPT,
     MSG_ERROR,
     MSG_HELP,
     MSG_PROCESSING,
     MSG_QUOTA_EXCEEDED,
     MSG_START,
     msg_balance,
-    msg_subscribe_prompt,
 )
 from app.config import settings
 from app.core.redis import get_redis
-from app.payments.tg_stars import send_subscription_invoice
+from app.payments.tg_stars import send_pack_invoice, send_premium_invoice
 from app.ratelimit import (
     check_quota,
     check_rate_limit,
@@ -41,59 +48,73 @@ from app.ratelimit import (
 )
 
 router = Router()
-
 LATEX_TTL_SECONDS = 3600
 
+
+# ─────────────────────── команды ───────────────────────
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     user = message.from_user
     logger.info(f"/start from {user.id} @{user.username}")
     await get_or_create_user(
-        telegram_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
+        telegram_id=user.id, username=user.username,
+        first_name=user.first_name, last_name=user.last_name,
         language_code=user.language_code,
     )
-    if is_admin(user.username):
-        await message.answer(MSG_ADMIN_WELCOME + "\n\n" + MSG_START)
-    else:
-        await message.answer(MSG_START)
+    prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
+    await message.answer(prefix + MSG_START, reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer("Главное меню 👇", reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(MSG_HELP)
+    await message.answer(MSG_HELP, reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message):
-    user = message.from_user
-    await get_or_create_user(
-        telegram_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-    )
-    if is_admin(user.username):
-        await message.answer("👑 Админ-аккаунт. Безлимит решений.")
-        return
-    quota = await check_quota(user.id, username=user.username)
-    until_str = (
-        quota.premium_until.strftime("%d.%m.%Y %H:%M UTC")
-        if quota.premium_until else None
-    )
-    await message.answer(msg_balance(
-        free_remaining=quota.free_remaining,
-        free_limit=settings.free_lifetime_tasks,
-        is_premium=quota.is_premium,
-        premium_until=until_str,
-    ))
+    await _send_balance(message)
 
 
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message, bot: Bot):
+    """Алиас для покупки Premium через команду."""
+    await _start_premium_purchase(message, bot)
+
+
+# ─────────────────────── кнопки меню ───────────────────────
+
+@router.message(F.text == BTN_BALANCE)
+async def menu_balance(message: Message):
+    await _send_balance(message)
+
+
+@router.message(F.text == BTN_HELP)
+async def menu_help(message: Message):
+    await message.answer(MSG_HELP)
+
+
+@router.message(F.text == BTN_BUY_PACK)
+async def menu_buy_pack(message: Message, bot: Bot):
+    user = message.from_user
+    if is_admin(user.username):
+        await message.answer("👑 У тебя безлимит как у админа — покупки не нужны.")
+        return
+    await message.answer(MSG_BUY_PACK_PROMPT)
+    await send_pack_invoice(bot, chat_id=message.chat.id)
+
+
+@router.message(F.text == BTN_BUY_PREMIUM)
+async def menu_buy_premium(message: Message, bot: Bot):
+    await _start_premium_purchase(message, bot)
+
+
+async def _start_premium_purchase(message: Message, bot: Bot):
     user = message.from_user
     if is_admin(user.username):
         await message.answer("👑 У тебя уже безлимит как у админа.")
@@ -103,40 +124,45 @@ async def cmd_subscribe(message: Message, bot: Bot):
         until_str = quota.premium_until.strftime("%d.%m.%Y") if quota.premium_until else ""
         await message.answer(
             f"💎 Premium уже активен до <b>{until_str}</b>.\n"
-            f"Доплата продлит подписку ещё на 30 дней."
+            f"Оплата продлит ещё на 30 дней."
         )
-    await message.answer(msg_subscribe_prompt())
-    await send_subscription_invoice(bot, chat_id=message.chat.id)
+    await message.answer(MSG_BUY_PREMIUM_PROMPT)
+    await send_premium_invoice(bot, chat_id=message.chat.id)
 
+
+async def _send_balance(message: Message):
+    user = message.from_user
+    await get_or_create_user(
+        telegram_id=user.id, username=user.username,
+        first_name=user.first_name, last_name=user.last_name,
+    )
+    quota = await check_quota(user.id, username=user.username)
+    await message.answer(msg_balance(quota), reply_markup=main_menu_keyboard())
+
+
+# ─────────────────────── фото → решение ───────────────────────
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
-    """Главный flow: фото → квота → pipeline → PNG."""
     user = message.from_user
     user_id = user.id
     username = user.username
     logger.info(f"Photo from {user_id} @{username}")
 
-    # Регистрация юзера (обновит username если поменялся)
     await get_or_create_user(
         telegram_id=user_id, username=username,
         first_name=user.first_name, last_name=user.last_name,
     )
 
-    # Rate limit (анти-спам)
     if not await check_rate_limit(user_id):
-        await message.answer(
-            "⏱ Слишком быстро! Подожди минутку и попробуй снова."
-        )
+        await message.answer("⏱ Слишком быстро! Подожди минутку и попробуй снова.")
         return
 
-    # Проверка квоты
     quota = await check_quota(user_id, username=username)
     if not quota.allowed:
-        await message.answer(MSG_QUOTA_EXCEEDED)
+        await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=main_menu_keyboard())
         return
 
-    # Скачиваем фото
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     photo_io = await bot.download_file(file.file_path)
@@ -147,36 +173,30 @@ async def handle_photo(message: Message, bot: Bot):
 
     try:
         result = await solve_task_from_photo(
-            photo_bytes,
-            user_id=user_id,
-            user_hint=caption,
+            photo_bytes, user_id=user_id, user_hint=caption,
         )
         latex_text = result.get("latex", "")
         png_bytes = result.get("png")
 
         if not png_bytes:
-            logger.warning(f"PNG render failed for user {user_id}, sending LaTeX as text")
+            logger.warning(f"PNG render failed for user {user_id}")
             await processing_msg.delete()
             chunks = _split_for_telegram(latex_text or "Не удалось получить решение.")
             for ch in chunks:
                 await message.answer(f"<pre>{_escape_html(ch)}</pre>", parse_mode="HTML")
         else:
-            # Сохраняем LaTeX в Redis для callback-кнопки
             token = secrets.token_urlsafe(8)
             redis = get_redis()
             await redis.set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
 
-            # Готовим caption с балансом
-            caption_text = _build_solution_caption(quota)
-
+            cap_text = _build_solution_caption(quota)
             await processing_msg.delete()
             await message.answer_photo(
                 photo=BufferedInputFile(png_bytes, filename="solution.png"),
-                caption=caption_text,
+                caption=cap_text,
                 reply_markup=latex_view_keyboard(token),
             )
 
-        # Списываем квоту (для admin/premium — no-op)
         await consume_quota(user_id, username=username)
 
     except Exception as e:
@@ -192,12 +212,15 @@ def _build_solution_caption(quota) -> str:
         return "✅ Готово · 👑 админ"
     if quota.is_premium:
         return "✅ Готово · 💎 Premium"
-    # После решения у юзера будет на 1 меньше — покажем как останется
+    # Списываем сначала credits, потом free — покажем что останется
+    if quota.credits > 0:
+        remaining = quota.credits - 1
+        return f"✅ Готово · купленных задач осталось: {remaining}"
     remaining_after = max(0, quota.free_remaining - 1)
     if remaining_after == 0:
         return (
-            f"✅ Готово · бесплатные решения закончились.\n"
-            f"Оформи Premium: /subscribe (399₽/мес)"
+            "✅ Готово · бесплатные решения закончились.\n"
+            "Выбери в меню пакет 79⭐ или Premium 149⭐"
         )
     return f"✅ Готово · осталось {remaining_after}/{settings.free_lifetime_tasks} бесплатных"
 
@@ -229,9 +252,11 @@ async def handle_show_latex(callback: CallbackQuery):
 
 @router.message(F.text)
 async def handle_text(message: Message):
+    """Любой текст не из меню — подсказка."""
     await message.answer(
         "📸 Кинь <b>фото</b> задачи — решу пошагово.\n"
-        "Команды: /help, /balance, /subscribe"
+        "Или выбери из меню под клавиатурой 👇",
+        reply_markup=main_menu_keyboard(),
     )
 
 

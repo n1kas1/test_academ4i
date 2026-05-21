@@ -53,6 +53,7 @@ class QuotaResult:
         allowed: bool,
         reason: str = "",
         free_remaining: int = 0,
+        credits: int = 0,
         is_premium: bool = False,
         is_admin: bool = False,
         premium_until: Optional[datetime] = None,
@@ -60,9 +61,15 @@ class QuotaResult:
         self.allowed = allowed
         self.reason = reason
         self.free_remaining = free_remaining
+        self.credits = credits
         self.is_premium = is_premium
         self.is_admin = is_admin
         self.premium_until = premium_until
+
+    @property
+    def total_remaining(self) -> int:
+        """Сколько решений всего доступно (credits + free)."""
+        return self.credits + self.free_remaining
 
 
 async def get_or_create_user(
@@ -130,6 +137,15 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
                 allowed=True,
                 is_premium=True,
                 premium_until=user.premium_until,
+                credits=user.credits,
+            )
+
+        # Купленные credits идут первыми
+        if user.credits > 0:
+            return QuotaResult(
+                allowed=True,
+                credits=user.credits,
+                free_remaining=user.free_remaining(settings.free_lifetime_tasks),
             )
 
         # Free tier
@@ -138,6 +154,7 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
             return QuotaResult(
                 allowed=True,
                 free_remaining=remaining,
+                credits=0,
                 is_premium=False,
             )
 
@@ -145,14 +162,16 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
             allowed=False,
             reason="free_exhausted",
             free_remaining=0,
+            credits=0,
             is_premium=False,
         )
 
 
 async def consume_quota(telegram_id: int, username: Optional[str] = None) -> None:
-    """Инкрементировать total_solved и free_used (если не premium и не админ)."""
+    """Инкрементировать total_solved и списать одну единицу квоты.
+    Порядок списания: premium (ничего) → credits → free_used.
+    """
     if is_admin(username):
-        # админ — статистику не ведём
         return
 
     now = datetime.now(timezone.utc)
@@ -163,8 +182,27 @@ async def consume_quota(telegram_id: int, username: Optional[str] = None) -> Non
             return
         user.total_solved += 1
         if not user.has_premium(now):
-            user.free_used += 1
+            if user.credits > 0:
+                user.credits -= 1
+            else:
+                user.free_used += 1
         await session.commit()
+
+
+async def add_credits(telegram_id: int, amount: int) -> int:
+    """Начислить N задач юзеру (после оплаты пакета). Возвращает новое значение credits."""
+    async with get_session() as session:
+        stmt = select(User).where(User.telegram_id == telegram_id)
+        user = (await session.execute(stmt)).scalar_one_or_none()
+        if user is None:
+            user = User(telegram_id=telegram_id, credits=amount)
+            session.add(user)
+        else:
+            user.credits += amount
+        await session.commit()
+        await session.refresh(user)
+        logger.info(f"Credits +{amount} for {telegram_id}, total={user.credits}")
+        return user.credits
 
 
 async def activate_premium(telegram_id: int, duration_days: int = 30) -> datetime:

@@ -38,9 +38,14 @@ class Settings(BaseSettings):
 
     # === Тарифы ===
     free_lifetime_tasks: int = 3       # 3 задачи бесплатно на всю жизнь аккаунта
-    premium_price_stars: int = 200     # 399₽ ≈ 200 Stars (Telegram сам конвертирует валюту)
-    premium_price_rub: int = 399       # справочно для UX-текстов
+
+    # Premium-подписка на 30 дней безлимит
+    premium_price_stars: int = 149
     premium_duration_days: int = 30
+
+    # Пакет — разовая покупка N задач (без срока)
+    pack_price_stars: int = 79
+    pack_tasks: int = 5
 
     # === Админы (безлимит) — usernames через запятую без @ ===
     admin_usernames: str = "manag31"

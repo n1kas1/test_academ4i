@@ -23,8 +23,11 @@ class User(Base, TimestampMixin):
     # Счётчик решений
     total_solved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # Free tier: 5 задач lifetime (FREE_LIFETIME_TASKS)
+    # Free tier: N задач lifetime (FREE_LIFETIME_TASKS)
     free_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Credits — задачи, купленные пакетом (поверх free, расходуются ПЕРЕД free)
+    credits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Premium подписка
     premium_until: Mapped[Optional[datetime]] = mapped_column(
