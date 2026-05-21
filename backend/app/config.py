@@ -37,9 +37,17 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
 
     # === Тарифы ===
-    free_lifetime_tasks: int = 5
-    premium_price_stars: int = 150
+    free_lifetime_tasks: int = 3       # 3 задачи бесплатно на всю жизнь аккаунта
+    premium_price_stars: int = 200     # 399₽ ≈ 200 Stars (Telegram сам конвертирует валюту)
+    premium_price_rub: int = 399       # справочно для UX-текстов
     premium_duration_days: int = 30
+
+    # === Админы (безлимит) — usernames через запятую без @ ===
+    admin_usernames: str = "manag31"
+
+    @property
+    def admin_usernames_set(self) -> set[str]:
+        return {u.strip().lower().lstrip("@") for u in self.admin_usernames.split(",") if u.strip()}
 
     # === Прочее ===
     env: str = "production"
