@@ -185,8 +185,8 @@ async def process_page(
                 if not txt or len(txt) < 10:
                     continue
                 # Авто-классификация если topic="auto"
-            chunk_topic = _auto_topic(txt) if topic == "auto" else topic
-            chunks.append(Chunk(
+                chunk_topic = _auto_topic(txt) if topic == "auto" else topic
+                chunks.append(Chunk(
                     chunk_type=it.get("type", "task"),
                     number=it.get("number"),
                     text=txt,
