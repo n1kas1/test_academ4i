@@ -1,0 +1,39 @@
+version: "3.9"
+
+# academ4i — Telegram бот-репетитор по матану/линалу.
+# Caddy НЕ запускаем в этом стеке: на VPS уже работает Caddy от academvoice.
+# Backend публикуется на хост-порт 8001, академcoice-Caddy проксирует academ4i.duckdns.org → 8001.
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: academ4i-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8001:8000"     # биндим ТОЛЬКО на localhost — Caddy academvoice проксирует
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./textbooks:/app/textbooks:ro   # учебники для парсера
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  redis:
+    image: redis:7-alpine
+    container_name: academ4i-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:

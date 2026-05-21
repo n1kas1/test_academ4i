@@ -1,0 +1,27 @@
+# Caddy конфиг для academ4i
+# Поменяй домен на свой (например, academ4i.duckdns.org)
+
+academ4i.duckdns.org {
+    # Автоматический HTTPS через Let's Encrypt
+    reverse_proxy backend:8000
+
+    # Health-check эндпоинт
+    handle /health {
+        reverse_proxy backend:8000
+    }
+
+    # Безопасные заголовки
+    header {
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # Логи
+    log {
+        output file /data/access.log
+        format json
+    }
+}

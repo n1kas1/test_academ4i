@@ -1,0 +1,40 @@
+# Env
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Учебники (большие PDF — не коммитим)
+textbooks/*.pdf
+textbooks/*.djvu
+!textbooks/.gitkeep
+
+# Логи
+*.log
+logs/
+
+# Docker
+.dockerignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Кэш парсера
+.parser_cache/
+mathpix_cache/
+
+# Локальные дампы БД
+*.sql
+*.dump
