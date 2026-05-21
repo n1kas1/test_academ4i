@@ -8,10 +8,12 @@ Dockerfile-зависимости: texlive-latex-* + texlive-extra-utils (pdfcro
 """
 import asyncio
 import hashlib
+import io
 import subprocess
 import tempfile
 from pathlib import Path
 
+from PIL import Image, ImageChops
 from loguru import logger
 
 CACHE_DIR = Path("/app/render_cache")
@@ -19,9 +21,9 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые PNG-кэши автоматически.
-TEMPLATE_VERSION = "v2"
+TEMPLATE_VERSION = "v3"
 
-# Шаблон: широкая страница 18см, большой запас по высоте, потом обрезаем pdfcrop.
+# Узкая страница (14см) → крупный шрифт на iPhone. Запас по высоте, потом обрезаем через PIL.
 LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T2A]{fontenc}
@@ -30,32 +32,33 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
-\geometry{paperwidth=18cm,paperheight=80cm,margin=1.2cm,top=1cm,bottom=1cm}
+\geometry{paperwidth=14cm,paperheight=80cm,margin=0.9cm,top=0.8cm,bottom=0.8cm}
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
-\setlength{\parskip}{0.6em}
+\setlength{\parskip}{0.65em}
 \renewcommand{\baselinestretch}{1.2}
 
 \definecolor{accent}{HTML}{1d4ed8}
-\definecolor{accentline}{HTML}{c7d2fe}
+\definecolor{accentline}{HTML}{a5b4fc}
 \definecolor{ok}{HTML}{047857}
 \definecolor{okbg}{HTML}{d1fae5}
 
-% Заголовок секции — крупный синий + тонкая полоса под ним
+% Заголовок секции — ЛИНИЯ СВЕРХУ + крупный синий текст.
+% Линия играет роль разделителя между секциями.
 \newcommand{\hd}[1]{%
-  \vspace{0.8em}\noindent%
+  \vspace{1.1em}%
+  \noindent\textcolor{accentline}{\rule{\linewidth}{1.3pt}}%
+  \par\vspace{0.25em}%
   {\color{accent}\textbf{\Large #1}}%
-  \par\vspace{-0.15em}%
-  \noindent\textcolor{accentline}{\rule{\linewidth}{1.2pt}}%
-  \par\vspace{0.4em}%
+  \par\vspace{0.5em}%
 }
 
 % Ответ — центрированный зелёный блок
 \newcommand{\ans}[1]{%
-  \par\vspace{0.7em}%
+  \par\vspace{0.8em}%
   \begin{center}
   \fcolorbox{ok}{okbg}{%
-    \begin{minipage}{0.92\linewidth}\centering%
+    \begin{minipage}{0.94\linewidth}\centering%
       {\color{ok}\textbf{\large Ответ:}}\quad\boxed{#1}%
     \end{minipage}%
   }%
@@ -63,7 +66,6 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
   \vspace{0.5em}%
 }
 
-% Альтернативная команда для шага решения — единообразное оформление
 \newcommand{\stp}[2]{\textbf{Шаг #1.}\quad #2}
 
 \begin{document}
@@ -105,24 +107,13 @@ def _compile_sync(latex_content: str, out_png: Path) -> bool:
             logger.error(f"pdflatex failed:\n{tail}")
             return False
 
-        # 2) pdfcrop — обрезаем пустоту снизу. Если не получится, продолжим с обычным PDF.
-        cropped_pdf = tmp / "doc-crop.pdf"
-        try:
-            subprocess.run(
-                ["pdfcrop", "--margins", "8 8 8 8", str(pdf_path), str(cropped_pdf)],
-                capture_output=True, check=True, timeout=15,
-            )
-            source_pdf = cropped_pdf if cropped_pdf.exists() else pdf_path
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"pdfcrop unavailable, using uncropped: {e}")
-            source_pdf = pdf_path
-
-        # 3) PDF → PNG, DPI 170 для хорошей чёткости
+        # 2) PDF → PNG (DPI 200 — крупно и чётко). pdfcrop не используем,
+        # обрежем белое через PIL независимо от tex-утилит.
         ppm_prefix = tmp / "out"
         try:
             subprocess.run(
-                ["pdftoppm", "-r", "170", "-png", "-singlefile",
-                 str(source_pdf), str(ppm_prefix)],
+                ["pdftoppm", "-r", "200", "-png", "-singlefile",
+                 str(pdf_path), str(ppm_prefix)],
                 capture_output=True, check=True, timeout=20,
             )
         except subprocess.CalledProcessError as e:
@@ -137,9 +128,36 @@ def _compile_sync(latex_content: str, out_png: Path) -> bool:
             logger.error(f"PNG not produced. Files: {list(tmp.iterdir())}")
             return False
 
+        # 3) Обрезаем белое поле через PIL (компенсация отсутствия pdfcrop).
+        trimmed_bytes = _trim_white(png_src.read_bytes())
+
         out_png.parent.mkdir(parents=True, exist_ok=True)
-        out_png.write_bytes(png_src.read_bytes())
+        out_png.write_bytes(trimmed_bytes)
         return True
+
+
+def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
+    """Обрезает белые поля вокруг изображения. Оставляет padding пикселей с каждой стороны."""
+    img = Image.open(io.BytesIO(png_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    diff = ImageChops.difference(img, bg)
+    bbox = diff.getbbox()
+    if bbox is None:
+        # Полностью белая картинка — возвращаем как есть
+        return png_bytes
+    # Добавим padding но не выйдем за границы оригинала
+    left, top, right, bottom = bbox
+    left = max(0, left - padding)
+    top = max(0, top - padding)
+    right = min(img.width, right + padding)
+    bottom = min(img.height, bottom + padding)
+    trimmed = img.crop((left, top, right, bottom))
+    buf = io.BytesIO()
+    trimmed.save(buf, format="PNG", optimize=True)
+    logger.info(f"PNG trimmed: {img.size} → {trimmed.size}")
+    return buf.getvalue()
 
 
 async def render_latex_to_png(latex_content: str) -> bytes | None:
