@@ -42,8 +42,12 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-# Доступ к app.* из backend
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+# Доступ к app.* в обоих окружениях:
+# - локально (вне контейнера): ./scripts/parse_textbook.py → ../backend/app
+# - в контейнере: /app/scripts/parse_textbook.py → /app/app
+_script_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(_script_dir.parent))             # для контейнера (/app)
+sys.path.insert(0, str(_script_dir.parent / "backend")) # для локалки
 
 from loguru import logger
 from openai import AsyncOpenAI
