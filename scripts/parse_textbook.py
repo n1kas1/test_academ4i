@@ -59,6 +59,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.config import settings
 from app.core.db import init_db, close_db, get_session
 from app.ai.embeddings import embed_batch
+from app.ai.pipeline import classify_topic as _auto_topic
 
 
 # === Конфиг парсера ===
@@ -183,7 +184,9 @@ async def process_page(
                 txt = (it.get("text") or "").strip()
                 if not txt or len(txt) < 10:
                     continue
-                chunks.append(Chunk(
+                # Авто-классификация если topic="auto"
+            chunk_topic = _auto_topic(txt) if topic == "auto" else topic
+            chunks.append(Chunk(
                     chunk_type=it.get("type", "task"),
                     number=it.get("number"),
                     text=txt,
@@ -191,7 +194,7 @@ async def process_page(
                     answer=it.get("answer"),
                     page=page_num,
                     source=source,
-                    topic=topic,
+                    topic=chunk_topic,
                 ))
             logger.info(f"page {page_num}: extracted {len(chunks)} chunks")
             return chunks
@@ -274,7 +277,7 @@ async def main():
     parser.add_argument("pdf_path", help="PDF учебника/задачника")
     parser.add_argument("--source", required=True, help='Например, "Демидович"')
     parser.add_argument("--topic", required=True,
-                        help="matan / lin_alg / groups / rings_fields / polynomials")
+                        help='matan / lin_alg / groups / rings_fields / polynomials / "auto"')
     parser.add_argument("--start", type=int, default=1, help="С какой страницы (1-based)")
     parser.add_argument("--end", type=int, default=None, help="По какую страницу включительно")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
