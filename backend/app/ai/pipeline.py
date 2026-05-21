@@ -37,7 +37,7 @@ from app.ai.claude import solve_with_claude_vision, extract_condition_text
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 
-CACHE_HIT_THRESHOLD = 0.93
+CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
 RAG_MIN_SIMILARITY = 0.65
 RAG_TOP_K = 5
 RAG_USE_TOP = 3
@@ -103,11 +103,18 @@ async def solve_task_from_photo(
 
     # 7) Cache miss — собираем RAG-контекст и решаем через Claude
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
+
+    # Router: простая задача → без extended thinking (~3₽);
+    # сложная (доказательства, исследования) → с extended thinking (~5₽).
+    use_thinking = is_complex_task(condition_text)
+    logger.info(f"Router decision: complex={use_thinking}")
+
     solution = await solve_with_claude_vision(
         image_b64=image_b64,
         media_type=media_type,
         user_hint=user_hint,
         rag_context=rag_context,
+        use_thinking=use_thinking,
     )
 
     # 8) Сохраняем в кэш для будущих юзеров
@@ -126,6 +133,28 @@ async def solve_task_from_photo(
 
     logger.info(f"Pipeline done for user {user_id}: {len(solution)} chars")
     return solution
+
+
+def is_complex_task(task_text: str) -> bool:
+    """Эвристика: задача требует extended thinking?
+
+    Сложные задачи (доказательства, исследования, "при каких условиях") решаются
+    с extended thinking budget — это дороже, но точнее.
+    Простые (вычисления, стандартные методы) — без thinking.
+    """
+    text = task_text.lower()
+    complex_markers = [
+        "докажите", "доказать", "доказательств",
+        "верно ли", "является ли", "следует ли",
+        "найдите все", "найти все", "опишите все",
+        "при каких", "для каких",
+        "исследуйте", "исследовать",
+        "показать что", "показать, что",
+        "обосновать", "обоснуйте",
+        "построить пример", "привести пример",
+        "опровергнуть",
+    ]
+    return any(m in text for m in complex_markers)
 
 
 def classify_topic(task_text: str) -> str:

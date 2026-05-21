@@ -140,8 +140,15 @@ async def solve_with_claude_vision(
     media_type: str,
     rag_context: str = "",
     user_hint: str = "",
+    use_thinking: bool | None = None,
 ) -> str:
-    """Решить задачу: Claude получает фото + RAG-контекст похожих задач."""
+    """Решить задачу: Claude получает фото + RAG-контекст похожих задач.
+
+    use_thinking:
+        True  → extended thinking (budget 2500) — для доказательств/исследований
+        False → без thinking — для типовых вычислений (быстрее, дешевле в 2-3x)
+        None  → использовать дефолт из settings.claude_use_extended_thinking
+    """
     client = get_client()
 
     user_blocks: list[dict] = [
@@ -178,9 +185,13 @@ async def solve_with_claude_vision(
         "messages": [{"role": "user", "content": user_blocks}],
     }
 
-    if settings.claude_use_extended_thinking:
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
-        kwargs["max_tokens"] = 12000
+    # Router thinking: явный параметр > дефолт из settings
+    thinking_on = use_thinking if use_thinking is not None else settings.claude_use_extended_thinking
+    if thinking_on:
+        # Budget 2500 (снижено с 8000) — хватает на доказательства,
+        # экономия ~60% на токенах thinking. Для простых задач — без thinking совсем.
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 2500}
+        kwargs["max_tokens"] = 5000
 
     response = await client.messages.create(**kwargs)
 
@@ -190,7 +201,7 @@ async def solve_with_claude_vision(
             solution_text += block.text
 
     logger.info(
-        f"Claude solved: in={response.usage.input_tokens}, "
+        f"Claude solved (thinking={thinking_on}): in={response.usage.input_tokens}, "
         f"out={response.usage.output_tokens}"
     )
 
