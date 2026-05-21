@@ -89,8 +89,10 @@ async def solve_task_from_photo(
     # 1) Подготовка фото
     image_b64, media_type = prepare_image(photo_bytes)
 
-    # 2) Лёгкий OCR — распознать условие в текст для retrieval
-    condition_text = await extract_condition_text(image_b64, media_type)
+    # 2) Лёгкий OCR — распознать условие в текст для retrieval.
+    # Прокидываем user_hint чтобы при нескольких задачах на фото распознался
+    # именно тот номер/подзадача что указал юзер.
+    condition_text = await extract_condition_text(image_b64, media_type, user_hint=user_hint)
 
     # 3) Если OCR провалился — fallback в простой vision-call без RAG
     if not condition_text or len(condition_text) < 20:
