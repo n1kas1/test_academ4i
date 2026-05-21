@@ -49,12 +49,26 @@ RAG_USE_TOP = 3
 # Очистка от возможной markdown-обёртки ```latex ... ```
 _FENCE_RE = re.compile(r"^```(?:latex|tex|math)?\s*\n?|\n?```\s*$", re.IGNORECASE)
 
+# Маркеры устаревшего формата (HTML с эмодзи) — НЕ принимаем как cache hit
+_LEGACY_MARKERS = ("<b>", "<i>", "<code>", "<pre>", "📝", "🎯", "🛠", "✅", "&lt;", "&gt;")
+# Маркеры нашего LaTeX-формата
+_LATEX_MARKERS = (r"\hd{", r"\ans{", r"\begin{", r"\frac", r"\int", "$$", r"\textbf")
+
 
 def _clean_latex(text: str) -> str:
     """Снимает code-fence обёртку если Claude её добавил."""
     text = text.strip()
     text = _FENCE_RE.sub("", text)
     return text.strip()
+
+
+def _is_valid_latex(text: str) -> bool:
+    """Проверка что cached решение — наш текущий LaTeX-формат, а не устаревший HTML."""
+    if not text:
+        return False
+    if any(m in text for m in _LEGACY_MARKERS):
+        return False
+    return any(m in text for m in _LATEX_MARKERS)
 
 
 async def solve_task_from_photo(
@@ -116,17 +130,22 @@ async def solve_task_from_photo(
     )
     if cache_candidates:
         hit = cache_candidates[0]
-        logger.info(
-            f"💎 CACHE HIT: sim={hit['cosine_sim']:.3f}, source={hit['source']}"
-        )
-        try:
-            await increment_usage(hit["id"])
-        except Exception as e:
-            logger.warning(f"increment_usage failed: {e}")
-        # В solution_markdown лежит LaTeX (наш generated кэш). Рендерим (с кэшем PNG).
         cached_latex = _clean_latex(hit["solution_markdown"])
-        png = await render_latex_to_png(cached_latex)
-        return {"latex": cached_latex, "png": png}
+        if _is_valid_latex(cached_latex):
+            logger.info(
+                f"💎 CACHE HIT: sim={hit['cosine_sim']:.3f}, source={hit['source']}"
+            )
+            try:
+                await increment_usage(hit["id"])
+            except Exception as e:
+                logger.warning(f"increment_usage failed: {e}")
+            png = await render_latex_to_png(cached_latex)
+            return {"latex": cached_latex, "png": png}
+        else:
+            logger.info(
+                f"Cache hit rejected (legacy HTML format): sim={hit['cosine_sim']:.3f} "
+                f"— regenerating in LaTeX"
+            )
 
     # 7) Cache miss — собираем RAG-контекст и решаем через Claude
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
