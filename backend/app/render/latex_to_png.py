@@ -21,7 +21,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые PNG-кэши автоматически.
-TEMPLATE_VERSION = "v4"
+TEMPLATE_VERSION = "v5"
 
 # Узкая страница (14см) → крупный шрифт на iPhone. Запас по высоте, потом обрезаем через PIL.
 LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
@@ -53,17 +53,12 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
   \par\vspace{0.5em}%
 }
 
-% Ответ — центрированный зелёный блок. Слово "Ответ" уже в \hd{Ответ} выше,
-% дублировать не нужно — здесь только выражение в boxed.
+% Ответ — просто крупный boxed по центру, без фона.
+% Слово "Ответ" уже в \hd{Ответ} выше — дублировать не надо.
 \newcommand{\ans}[1]{%
   \par\vspace{0.6em}%
   \begin{center}%
-  \setlength{\fboxsep}{10pt}%
-  \fcolorbox{ok}{okbg}{%
-    \parbox{\dimexpr 0.80\linewidth-2\fboxsep\relax}{%
-      \centering\color{ok}\large\boxed{#1}%
-    }%
-  }%
+    \large\boxed{#1}%
   \end{center}%
   \vspace{0.5em}%
 }
