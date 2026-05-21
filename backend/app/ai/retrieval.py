@@ -25,11 +25,21 @@ async def find_similar_solutions(
     topic: str | None = None,
     top_k: int = 5,
     min_similarity: float = 0.65,
+    only_generated: bool = False,
 ) -> list[dict]:
-    """Поиск top-K похожих задач по cosine similarity. Опционально фильтр по теме.
+    """Поиск top-K похожих задач по cosine similarity.
 
-    Возвращает список dict с полями:
-      id, task_text, task_latex, solution_markdown, topic, source, cosine_sim
+    Args:
+        embedding: вектор условия задачи юзера
+        topic: фильтр по теме (matan / lin_alg / ...)
+        top_k: сколько вернуть
+        min_similarity: порог cosine sim
+        only_generated: если True — вернуть только чанки с полным решением
+                        (source='generated' — там наш Claude уже решал).
+                        Используется для cache_hit чтобы не возвращать
+                        просто условие из учебника как "решение".
+
+    Возвращает список dict: id, task_text, solution_markdown, topic, source, cosine_sim
     """
     vec = _vec_literal(embedding)
 
@@ -47,6 +57,8 @@ async def find_similar_solutions(
     """
     if topic:
         base_sql += " AND topic = :topic"
+    if only_generated:
+        base_sql += " AND source = 'generated'"
     base_sql += " ORDER BY embedding <=> CAST(:emb AS vector) LIMIT :top_k"
 
     params = {"emb": vec, "min_sim": min_similarity, "top_k": top_k}
@@ -60,11 +72,11 @@ async def find_similar_solutions(
     out = [dict(r) for r in rows]
     if out:
         logger.info(
-            f"RAG retrieval: top_sim={out[0]['cosine_sim']:.3f}, "
+            f"RAG retrieval (only_generated={only_generated}): top_sim={out[0]['cosine_sim']:.3f}, "
             f"sources={[r['source'] for r in out[:3]]}"
         )
     else:
-        logger.info(f"RAG retrieval: no matches (topic={topic}, min_sim={min_similarity})")
+        logger.info(f"RAG retrieval: no matches (topic={topic}, min_sim={min_similarity}, only_generated={only_generated})")
     return out
 
 

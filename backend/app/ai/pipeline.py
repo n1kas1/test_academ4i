@@ -71,18 +71,27 @@ async def solve_task_from_photo(
     topic = classify_topic(condition_text)
     logger.info(f"Topic: {topic} | condition: {condition_text[:120]}...")
 
-    # 5) Эмбеддинг и поиск похожих
+    # 5) Эмбеддинг и поиск похожих (для RAG-контекста)
     embedding = await embed_text(condition_text)
-    similar = await find_similar_solutions(
+    similar_for_rag = await find_similar_solutions(
         embedding,
         topic=topic,
         top_k=RAG_TOP_K,
         min_similarity=RAG_MIN_SIMILARITY,
+        only_generated=False,   # все источники (учебники + наши решения)
     )
 
-    # 6) Cache hit — возвращаем готовое решение мгновенно
-    if similar and similar[0]["cosine_sim"] > CACHE_HIT_THRESHOLD:
-        hit = similar[0]
+    # 6) Cache hit ТОЛЬКО среди готовых решений (source='generated').
+    #    Учебники без решений (только условие) — не отдаём как готовый ответ.
+    cache_candidates = await find_similar_solutions(
+        embedding,
+        topic=topic,
+        top_k=1,
+        min_similarity=CACHE_HIT_THRESHOLD,
+        only_generated=True,
+    )
+    if cache_candidates:
+        hit = cache_candidates[0]
         logger.info(
             f"💎 CACHE HIT: sim={hit['cosine_sim']:.3f}, source={hit['source']}"
         )
@@ -93,7 +102,7 @@ async def solve_task_from_photo(
         return hit["solution_markdown"]
 
     # 7) Cache miss — собираем RAG-контекст и решаем через Claude
-    rag_context = build_rag_context(similar[:RAG_USE_TOP])
+    rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
     solution = await solve_with_claude_vision(
         image_b64=image_b64,
         media_type=media_type,
