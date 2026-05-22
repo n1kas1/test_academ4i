@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 from loguru import logger
 from sqlalchemy import text
 
@@ -22,6 +23,7 @@ from app.core.redis import get_redis
 CHECK_INTERVAL_SEC = 3 * 3600        # проверяем раз в 3 часа
 _DEDUP_TTL_SEC = 40 * 24 * 3600      # ключи дедупа живут ~40 дней (дольше периода подписки)
 _STARTUP_DELAY_SEC = 60              # дать приложению подняться перед первой проверкой
+_SEND_DELAY_SEC = 0.05               # ~20 msg/s — держим темп ниже flood-лимита Telegram
 
 # Скоро закончится: premium_until в ближайшие 2 дня.
 _SQL_EXPIRING = (
@@ -36,8 +38,34 @@ _SQL_EXPIRED = (
 )
 
 
+# (kind, sql, текст) каждого типа уведомления — порядок прохода.
+_EVENTS = (
+    ("remind", _SQL_EXPIRING, MSG_PREMIUM_EXPIRING),
+    ("expired", _SQL_EXPIRED, MSG_PREMIUM_EXPIRED),
+)
+
+
 def _key(kind: str, tg: int, until: datetime) -> str:
     return f"premind:{kind}:{tg}:{int(until.timestamp())}"
+
+
+async def _send_once(bot: Bot, tg: int, text_msg: str) -> bool:
+    """Отправить одно уведомление. True при успехе.
+
+    На flood-control (429) — переждать retry_after и повторить один раз. Прочие
+    ошибки (юзер заблокировал бота и т.п.) — пропустить, не валя всю рассылку.
+    """
+    for _ in range(2):
+        try:
+            await bot.send_message(tg, text_msg, reply_markup=renew_premium_keyboard())
+            return True
+        except TelegramRetryAfter as e:
+            logger.warning(f"premium notify flood: sleeping {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            logger.warning(f"premium notify skip {tg}: {e}")
+            return False
+    return False
 
 
 async def _notify(bot: Bot, kind: str, sql: str, text_msg: str) -> None:
@@ -50,21 +78,18 @@ async def _notify(bot: Bot, kind: str, sql: str, text_msg: str) -> None:
         key = _key(kind, tg, until)
         if await redis.exists(key):
             continue
-        try:
-            await bot.send_message(tg, text_msg, reply_markup=renew_premium_keyboard())
+        if await _send_once(bot, tg, text_msg):
             await redis.set(key, "1", ex=_DEDUP_TTL_SEC)  # помечаем только при успехе
             sent += 1
-        except Exception as e:
-            # юзер заблокировал бота и т.п. — пропускаем, не валим всю рассылку
-            logger.info(f"premium notify {kind} skip {tg}: {e}")
+            await asyncio.sleep(_SEND_DELAY_SEC)
     if rows:
         logger.info(f"premium notify {kind}: candidates={len(rows)} sent={sent}")
 
 
 async def run_premium_checks(bot: Bot) -> None:
     """Один проход: разослать напоминания о скором конце и об окончании."""
-    await _notify(bot, "remind", _SQL_EXPIRING, MSG_PREMIUM_EXPIRING)
-    await _notify(bot, "expired", _SQL_EXPIRED, MSG_PREMIUM_EXPIRED)
+    for kind, sql, text_msg in _EVENTS:
+        await _notify(bot, kind, sql, text_msg)
 
 
 async def premium_notifier_loop(bot: Bot) -> None:
