@@ -59,8 +59,9 @@ docker compose run --rm backend alembic upgrade head
 **Если вылетит ошибка про prepared statements** — это Transaction pooler Supabase. Подключаемся напрямую к Session pooler для миграций:
 
 ```bash
-# Временно подменим DATABASE_URL для миграций (порт 5432 вместо 6543)
-DATABASE_URL='postgresql+asyncpg://postgres.cssishlvnvtrralqmlkt:MUlijo26nsaWlBBn@aws-1-eu-central-1.pooler.supabase.com:5432/postgres' \
+# Временно подменим DATABASE_URL для миграций (порт 5432 вместо 6543).
+# Подставь реальные значения из своего .env (PROJECT_REF / PWD), сюда секреты НЕ коммитим.
+DATABASE_URL='postgresql+asyncpg://postgres.PROJECT_REF:PWD@aws-1-eu-central-1.pooler.supabase.com:5432/postgres' \
   docker compose run --rm -e DATABASE_URL backend alembic upgrade head
 ```
 

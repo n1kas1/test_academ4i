@@ -1,6 +1,7 @@
 # Env
 .env
 .env.local
+.env.bak*
 
 # Python
 __pycache__/
@@ -34,6 +35,10 @@ logs/
 # Кэш парсера
 .parser_cache/
 mathpix_cache/
+
+# Кэш рендера LaTeX→PNG (создаётся бэкендом в bind-mount)
+backend/render_cache/
+render_cache/
 
 # Локальные дампы БД
 *.sql
