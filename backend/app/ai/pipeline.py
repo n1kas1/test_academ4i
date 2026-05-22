@@ -90,6 +90,8 @@ async def solve_task_from_photo(
     user_id: int,
     user_hint: str = "",
     on_status: StatusCb = None,
+    skip_cache: bool = False,
+    force_thinking: bool = False,
 ) -> dict:
     """Главная точка входа из bot/handlers.py.
 
@@ -150,7 +152,8 @@ async def solve_task_from_photo(
 
     # 6) Cache hit ТОЛЬКО среди готовых решений (source='generated').
     #    Учебники без решений (только условие) — не отдаём как готовый ответ.
-    cache_candidates = await find_similar_solutions(
+    #    skip_cache=True (например «перерешать») → не берём из кэша, решаем заново.
+    cache_candidates = [] if skip_cache else await find_similar_solutions(
         embedding,
         topic=topic,
         top_k=1,
@@ -182,8 +185,8 @@ async def solve_task_from_photo(
 
     # Router: простая задача → без extended thinking (~3₽);
     # сложная (доказательства, исследования) → с extended thinking (~5₽).
-    use_thinking = is_complex_task(condition_text)
-    logger.info(f"Router decision: complex={use_thinking}")
+    use_thinking = True if force_thinking else is_complex_task(condition_text)
+    logger.info(f"Router decision: complex={use_thinking} (force={force_thinking})")
 
     await _status(on_status, "🧠 Решаю…" if not use_thinking else "🧠 Думаю над доказательством…")
     solution_raw = await solve_with_claude_vision(

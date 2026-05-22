@@ -35,14 +35,23 @@ def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> Repl
     )
 
 
-def latex_view_keyboard(latex_token: str) -> InlineKeyboardMarkup:
-    """Inline под PNG-решением."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📋 Показать LaTeX (для копирования)",
-            callback_data=f"latex:{latex_token}",
-        ),
-    ]])
+def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup:
+    """Inline под решением: показать LaTeX + (опц.) перерешать.
+
+    Оба действия на одном token (данные решения лежат в Redis под sol:{token}).
+    allow_resolve=False — для результата самого «перерешать» (одна бесплатная
+    попытка на решение, чтобы не было бесконечной цепочки).
+    """
+    rows = [[InlineKeyboardButton(
+        text="📋 Показать LaTeX (для копирования)",
+        callback_data=f"latex:{token}",
+    )]]
+    if allow_resolve:
+        rows.append([InlineKeyboardButton(
+            text="🔄 Перерешать (если ответ неверный)",
+            callback_data=f"resolve:{token}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:

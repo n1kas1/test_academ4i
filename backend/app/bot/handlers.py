@@ -5,11 +5,14 @@ Routing:
   фото → check_quota → pipeline → PNG + LaTeX button → consume_quota
   Кнопки меню (BTN_*) — переход на покупку или /balance / /help
 """
+import asyncio
+import io
 import json
 import secrets
 from pathlib import Path
 
 from aiogram import Bot, F, Router
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -25,8 +28,8 @@ from app.bot.keyboards import (
     BTN_BUY_PACK,
     BTN_BUY_PREMIUM,
     BTN_HELP,
-    latex_view_keyboard,
     main_menu_keyboard,
+    solution_keyboard,
     task_choice_keyboard,
 )
 from app.bot.messages import (
@@ -54,8 +57,12 @@ from app.ratelimit import (
 )
 
 router = Router()
-LATEX_TTL_SECONDS = 3600
 TASKPICK_TTL_SECONDS = 3600
+SOLUTION_TTL_SECONDS = 3600
+
+# Документы, которые принимаем как задачу: картинки и PDF.
+_DOC_PDF = "application/pdf"
+_MAX_DOC_BYTES = 20 * 1024 * 1024  # лимит загрузки файла Telegram-ботом
 
 # Демо-картинка решения для /start (статический ассет).
 _DEMO_PATH = Path(__file__).parent / "assets" / "demo_solution.png"
@@ -186,11 +193,25 @@ async def _send_balance(message: Message):
 
 # ─────────────────────── фото → решение ───────────────────────
 
-async def _download_photo(bot: Bot, file_id: str) -> bytes:
-    """Скачать фото из Telegram по file_id."""
+def _pdf_first_page_png(pdf_bytes: bytes) -> bytes:
+    """Первая страница PDF → PNG (через poppler/pdf2image). Синхронно."""
+    from pdf2image import convert_from_bytes
+    images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+    if not images:
+        raise ValueError("PDF has no pages")
+    buf = io.BytesIO()
+    images[0].save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def _download_image(bot: Bot, file_id: str, is_pdf: bool = False) -> bytes:
+    """Скачать вложение по file_id. PDF конвертируем в PNG первой страницы."""
     file = await bot.get_file(file_id)
-    photo_io = await bot.download_file(file.file_path)
-    return photo_io.read() if hasattr(photo_io, "read") else photo_io
+    bio = await bot.download_file(file.file_path)
+    raw = bio.read() if hasattr(bio, "read") else bio
+    if is_pdf:
+        return await asyncio.to_thread(_pdf_first_page_png, raw)
+    return raw
 
 
 def _make_status_cb(processing_msg: Message):
@@ -206,13 +227,16 @@ def _make_status_cb(processing_msg: Message):
 
 async def _send_solution_result(
     bot: Bot, chat_id: int, processing_msg: Message, result: dict,
-    quota, user_id: int, username: str | None,
+    *, caption: str, image_ref: dict | None = None, allow_resolve: bool = True,
 ) -> None:
-    """Доставить решение: превью-фото первой страницы + полный PDF. Списать квоту."""
+    """Доставить решение: превью-фото первой страницы + полный PDF.
+
+    image_ref={"file_id","is_pdf","hint"} — нужен для кнопки «перерешать».
+    Квоту здесь НЕ списываем — это делает вызывающий (re-solve не списывает).
+    """
     latex_text = result.get("latex", "")
     pdf_bytes = result.get("pdf")
     png_bytes = result.get("png")
-    cap = _build_solution_caption(quota)
 
     try:
         await processing_msg.delete()
@@ -221,22 +245,26 @@ async def _send_solution_result(
 
     # Рендер упал целиком → отдаём LaTeX текстом (хоть что-то).
     if not pdf_bytes and not png_bytes:
-        logger.warning(f"Render failed for user {user_id}")
+        logger.warning("Render failed — sending LaTeX as text")
         for ch in _split_for_telegram(latex_text or "Не удалось оформить решение."):
             await bot.send_message(chat_id, f"<pre>{_escape_html(ch)}</pre>")
-        await consume_quota(user_id, username=username)
         return
 
+    # Данные решения в Redis: latex для кнопки + (опц.) ссылка на фото для «перерешать».
     token = secrets.token_urlsafe(8)
-    await get_redis().set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
-    kb = latex_view_keyboard(token)
+    payload = {"latex": latex_text}
+    can_resolve = bool(allow_resolve and image_ref and image_ref.get("file_id"))
+    if can_resolve:
+        payload.update(image_ref)
+    await get_redis().set(f"sol:{token}", json.dumps(payload), ex=SOLUTION_TTL_SECONDS)
+    kb = solution_keyboard(token, allow_resolve=can_resolve)
 
     if png_bytes and pdf_bytes:
         # Превью первой страницы (быстрый взгляд) + полный PDF (чётко, целиком).
         await bot.send_photo(
             chat_id,
             photo=BufferedInputFile(png_bytes, filename="preview.png"),
-            caption=cap,
+            caption=caption,
         )
         await bot.send_document(
             chat_id,
@@ -248,26 +276,25 @@ async def _send_solution_result(
         await bot.send_document(
             chat_id,
             document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
-            caption=cap,
+            caption=caption,
             reply_markup=kb,
         )
     else:  # только превью-картинка
         await bot.send_photo(
             chat_id,
             photo=BufferedInputFile(png_bytes, filename="solution.png"),
-            caption=cap,
+            caption=caption,
             reply_markup=kb,
         )
 
-    await consume_quota(user_id, username=username)
 
-
-@router.message(F.photo)
-async def handle_photo(message: Message, bot: Bot):
+async def _solve_incoming(
+    message: Message, bot: Bot, file_id: str, is_pdf: bool, caption: str,
+) -> None:
+    """Единый поток: фото или документ → решение. Лимиты, квота, статус, доставка."""
     user = message.from_user
     user_id = user.id
     username = user.username
-    logger.info(f"Photo from {user_id} @{username}")
 
     await get_or_create_user(
         telegram_id=user_id, username=username,
@@ -284,26 +311,33 @@ async def handle_photo(message: Message, bot: Bot):
         await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
         return
 
-    file_id = message.photo[-1].file_id
-    caption = (message.caption or "").strip()
-    photo_bytes = await _download_photo(bot, file_id)
+    try:
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+
+    try:
+        image_bytes = await _download_image(bot, file_id, is_pdf)
+    except Exception as e:
+        logger.warning(f"download/convert failed for {user_id}: {e}")
+        await message.answer("😔 Не смог открыть файл. Пришли фото или PDF задачи ещё раз.")
+        return
 
     processing_msg = await message.answer(MSG_PROCESSING)
 
     try:
         result = await solve_task_from_photo(
-            photo_bytes, user_id=user_id, user_hint=caption,
+            image_bytes, user_id=user_id, user_hint=caption,
             on_status=_make_status_cb(processing_msg),
         )
 
-        # Несколько задач на фото и подписи нет → спрашиваем какую решать.
-        # Квоту НЕ списываем — решения ещё не было.
+        # Несколько задач и подписи нет → спрашиваем какую решать (квоту НЕ списываем).
         if result.get("needs_choice"):
             task_ids = result["task_ids"]
             token = secrets.token_urlsafe(8)
             await get_redis().set(
                 f"taskpick:{token}",
-                json.dumps({"file_id": file_id, "task_ids": task_ids}),
+                json.dumps({"file_id": file_id, "is_pdf": is_pdf, "task_ids": task_ids}),
                 ex=TASKPICK_TTL_SECONDS,
             )
             try:
@@ -317,8 +351,12 @@ async def handle_photo(message: Message, bot: Bot):
             return
 
         await _send_solution_result(
-            bot, message.chat.id, processing_msg, result, quota, user_id, username,
+            bot, message.chat.id, processing_msg, result,
+            caption=_build_solution_caption(quota),
+            image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": caption},
+            allow_resolve=True,
         )
+        await consume_quota(user_id, username=username)
 
     except Exception as e:
         logger.exception(f"Pipeline error for user {user_id}: {e}")
@@ -326,6 +364,30 @@ async def handle_photo(message: Message, bot: Bot):
             await processing_msg.edit_text(MSG_ERROR)
         except Exception:
             await message.answer(MSG_ERROR)
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot):
+    logger.info(f"Photo from {message.from_user.id} @{message.from_user.username}")
+    await _solve_incoming(
+        message, bot, message.photo[-1].file_id, False, (message.caption or "").strip(),
+    )
+
+
+@router.message(F.document)
+async def handle_document(message: Message, bot: Bot):
+    """Фото-как-файл (скриншот без сжатия) или PDF-страница методички."""
+    doc = message.document
+    mime = (doc.mime_type or "").lower()
+    is_pdf = mime == _DOC_PDF
+    if not (mime.startswith("image/") or is_pdf):
+        await message.answer("📸 Пришли фото задачи, скриншот или PDF — другие файлы я не решаю.")
+        return
+    if doc.file_size and doc.file_size > _MAX_DOC_BYTES:
+        await message.answer("⚠️ Файл слишком большой (макс 20 МБ). Пришли фото или PDF поменьше.")
+        return
+    logger.info(f"Document from {message.from_user.id} mime={mime}")
+    await _solve_incoming(message, bot, doc.file_id, is_pdf, (message.caption or "").strip())
 
 
 @router.callback_query(F.data.startswith("pick:"))
@@ -352,6 +414,7 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     data = json.loads(raw)
     task_ids = data.get("task_ids", [])
     file_id = data.get("file_id")
+    is_pdf = data.get("is_pdf", False)
 
     try:
         idx = int(idx_str)
@@ -383,15 +446,20 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     except Exception:
         processing_msg = await callback.message.answer(MSG_PROCESSING)
 
+    hint = f"реши задачу №{chosen}"
     try:
-        photo_bytes = await _download_photo(bot, file_id)
+        image_bytes = await _download_image(bot, file_id, is_pdf)
         result = await solve_task_from_photo(
-            photo_bytes, user_id=user_id, user_hint=f"реши задачу №{chosen}",
+            image_bytes, user_id=user_id, user_hint=hint,
             on_status=_make_status_cb(processing_msg),
         )
         await _send_solution_result(
-            bot, callback.message.chat.id, processing_msg, result, quota, user_id, username,
+            bot, callback.message.chat.id, processing_msg, result,
+            caption=_build_solution_caption(quota),
+            image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": hint},
+            allow_resolve=True,
         )
+        await consume_quota(user_id, username=username)
     except Exception as e:
         logger.exception(f"Pick-task pipeline error for user {user_id}: {e}")
         try:
@@ -418,11 +486,24 @@ def _build_solution_caption(quota) -> str:
     return f"✅ Готово · осталось {remaining_after}/{settings.free_lifetime_tasks} бесплатных"
 
 
+async def _load_sol(token: str) -> dict | None:
+    """Прочитать данные решения из Redis (sol:{token})."""
+    raw = await get_redis().get(f"sol:{token}")
+    if not raw:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 @router.callback_query(F.data.startswith("latex:"))
 async def handle_show_latex(callback: CallbackQuery):
     token = callback.data.removeprefix("latex:")
-    redis = get_redis()
-    latex_text = await redis.get(f"latex:{token}")
+    data = await _load_sol(token)
+    latex_text = (data or {}).get("latex")
 
     if not latex_text:
         await callback.answer(
@@ -431,16 +512,59 @@ async def handle_show_latex(callback: CallbackQuery):
         )
         return
 
-    if isinstance(latex_text, bytes):
-        latex_text = latex_text.decode("utf-8")
-
-    chunks = _split_for_telegram(latex_text, max_len=3500)
-    for ch in chunks:
-        await callback.message.answer(
-            f"<pre>{_escape_html(ch)}</pre>",
-            parse_mode="HTML",
-        )
+    for ch in _split_for_telegram(latex_text, max_len=3500):
+        await callback.message.answer(f"<pre>{_escape_html(ch)}</pre>", parse_mode="HTML")
     await callback.answer("LaTeX отправлен — можно копировать")
+
+
+@router.callback_query(F.data.startswith("resolve:"))
+async def handle_resolve(callback: CallbackQuery, bot: Bot):
+    """«Перерешать» — одна бесплатная попытка на решение, мимо кэша, с thinking."""
+    user = callback.from_user
+    user_id = user.id
+
+    token = callback.data.removeprefix("resolve:")
+    data = await _load_sol(token)
+    if not data or not data.get("file_id"):
+        await callback.answer(
+            "Это решение уже перерешано или устарело. Пришли задачу снова.",
+            show_alert=True,
+        )
+        return
+
+    if not await check_rate_limit(user_id):
+        await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
+        return
+
+    await callback.answer("🔄 Перерешиваю заново…")
+    await get_redis().delete(f"sol:{token}")  # одноразово — одна бесплатная попытка
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # снять кнопки со старого
+    except Exception:
+        pass
+
+    processing_msg = await callback.message.answer("🔄 Решаю заново, перепроверяю вычисления…")
+    hint = (data.get("hint") or "").strip()
+    resolve_hint = (hint + " Перепроверь вычисления, реши заново внимательно.").strip()
+    try:
+        image_bytes = await _download_image(bot, data["file_id"], data.get("is_pdf", False))
+        result = await solve_task_from_photo(
+            image_bytes, user_id=user_id, user_hint=resolve_hint,
+            on_status=_make_status_cb(processing_msg),
+            skip_cache=True, force_thinking=True,
+        )
+        # Re-solve бесплатный → квоту НЕ списываем, и повторную кнопку не вешаем.
+        await _send_solution_result(
+            bot, callback.message.chat.id, processing_msg, result,
+            caption="🔄 Готово — перерешано заново (квота не списана).",
+            allow_resolve=False,
+        )
+    except Exception as e:
+        logger.exception(f"Resolve error for user {user_id}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_ERROR)
+        except Exception:
+            await callback.message.answer(MSG_ERROR)
 
 
 @router.message(F.text)
