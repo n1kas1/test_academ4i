@@ -208,30 +208,55 @@ async def _send_solution_result(
     bot: Bot, chat_id: int, processing_msg: Message, result: dict,
     quota, user_id: int, username: str | None,
 ) -> None:
-    """Доставить готовое решение (PNG + кнопка LaTeX) и списать квоту."""
+    """Доставить решение: превью-фото первой страницы + полный PDF. Списать квоту."""
     latex_text = result.get("latex", "")
+    pdf_bytes = result.get("pdf")
     png_bytes = result.get("png")
+    cap = _build_solution_caption(quota)
 
-    if not png_bytes:
-        logger.warning(f"PNG render failed for user {user_id}")
-        try:
-            await processing_msg.delete()
-        except Exception:
-            pass
-        for ch in _split_for_telegram(latex_text or "Не удалось получить решение."):
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    # Рендер упал целиком → отдаём LaTeX текстом (хоть что-то).
+    if not pdf_bytes and not png_bytes:
+        logger.warning(f"Render failed for user {user_id}")
+        for ch in _split_for_telegram(latex_text or "Не удалось оформить решение."):
             await bot.send_message(chat_id, f"<pre>{_escape_html(ch)}</pre>")
-    else:
-        token = secrets.token_urlsafe(8)
-        await get_redis().set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
-        try:
-            await processing_msg.delete()
-        except Exception:
-            pass
+        await consume_quota(user_id, username=username)
+        return
+
+    token = secrets.token_urlsafe(8)
+    await get_redis().set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
+    kb = latex_view_keyboard(token)
+
+    if png_bytes and pdf_bytes:
+        # Превью первой страницы (быстрый взгляд) + полный PDF (чётко, целиком).
+        await bot.send_photo(
+            chat_id,
+            photo=BufferedInputFile(png_bytes, filename="preview.png"),
+            caption=cap,
+        )
+        await bot.send_document(
+            chat_id,
+            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
+            caption="📄 Полное решение — открой, чтобы увеличить и пролистать.",
+            reply_markup=kb,
+        )
+    elif pdf_bytes:
+        await bot.send_document(
+            chat_id,
+            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
+            caption=cap,
+            reply_markup=kb,
+        )
+    else:  # только превью-картинка
         await bot.send_photo(
             chat_id,
             photo=BufferedInputFile(png_bytes, filename="solution.png"),
-            caption=_build_solution_caption(quota),
-            reply_markup=latex_view_keyboard(token),
+            caption=cap,
+            reply_markup=kb,
         )
 
     await consume_quota(user_id, username=username)

@@ -20,10 +20,12 @@ CACHE_DIR = Path("/app/render_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
-# Это инвалидирует все старые PNG-кэши автоматически.
-TEMPLATE_VERSION = "v5"
+# Это инвалидирует все старые кэши автоматически.
+TEMPLATE_VERSION = "v6"
 
-# Узкая страница (14см) → крупный шрифт на iPhone. Запас по высоте, потом обрезаем через PIL.
+# Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
+# высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
+# одна 80-см страница, и хвост с ответом терялся при конвертации).
 LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T2A]{fontenc}
@@ -32,7 +34,7 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
-\geometry{paperwidth=14cm,paperheight=80cm,margin=0.9cm,top=0.8cm,bottom=0.8cm}
+\geometry{paperwidth=14cm,paperheight=22cm,margin=0.9cm,top=0.8cm,bottom=0.8cm}
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{0.65em}
@@ -77,9 +79,14 @@ def _content_hash(latex: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
-def _compile_sync(latex_content: str, out_png: Path) -> bool:
-    """Синхронно: latex → pdflatex → pdfcrop → pdftoppm → PNG.
-    Возвращает True если успешно.
+# DPI превью первой страницы (выше = чётче формулы; 300 ≈ 1654px по ширине 14см).
+PREVIEW_DPI = 300
+
+
+def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
+    """Синхронно: latex → pdflatex → PDF + PNG-превью первой страницы.
+
+    Пишет полный PDF в out_pdf и превью 1-й страницы в out_png. True если успешно.
     """
     with tempfile.TemporaryDirectory(prefix="latex_") as tmpdir:
         tmp = Path(tmpdir)
@@ -87,11 +94,11 @@ def _compile_sync(latex_content: str, out_png: Path) -> bool:
         full_doc = LATEX_TEMPLATE.replace("%CONTENT%", latex_content)
         tex_path.write_text(full_doc, encoding="utf-8")
 
-        # 1) pdflatex
+        # 1) pdflatex. -no-shell-escape — контент идёт от LLM, отключаем \write18.
         try:
             res = subprocess.run(
                 ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
-                 "-output-directory", str(tmp), str(tex_path)],
+                 "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
                 capture_output=True, text=True, timeout=30,
             )
         except subprocess.TimeoutExpired:
@@ -104,12 +111,14 @@ def _compile_sync(latex_content: str, out_png: Path) -> bool:
             logger.error(f"pdflatex failed:\n{tail}")
             return False
 
-        # 2) PDF → PNG (DPI 200 — крупно и чётко). pdfcrop не используем,
-        # обрежем белое через PIL независимо от tex-утилит.
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(pdf_path.read_bytes())
+
+        # 2) Превью ПЕРВОЙ страницы → PNG. Полное решение остаётся в PDF.
         ppm_prefix = tmp / "out"
         try:
             subprocess.run(
-                ["pdftoppm", "-r", "200", "-png", "-singlefile",
+                ["pdftoppm", "-r", str(PREVIEW_DPI), "-png", "-singlefile",
                  str(pdf_path), str(ppm_prefix)],
                 capture_output=True, check=True, timeout=20,
             )
@@ -125,11 +134,8 @@ def _compile_sync(latex_content: str, out_png: Path) -> bool:
             logger.error(f"PNG not produced. Files: {list(tmp.iterdir())}")
             return False
 
-        # 3) Обрезаем белое поле через PIL (компенсация отсутствия pdfcrop).
-        trimmed_bytes = _trim_white(png_src.read_bytes())
-
-        out_png.parent.mkdir(parents=True, exist_ok=True)
-        out_png.write_bytes(trimmed_bytes)
+        # 3) Обрезаем белое поле превью через PIL.
+        out_png.write_bytes(_trim_white(png_src.read_bytes()))
         return True
 
 
@@ -157,23 +163,34 @@ def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
     return buf.getvalue()
 
 
-async def render_latex_to_png(latex_content: str) -> bytes | None:
-    """Асинхронный фасад. Кэш по hash контента. Возвращает байты PNG или None."""
+async def render_solution(latex_content: str) -> dict:
+    """Асинхронный фасад. Кэш по hash контента.
+
+    Возвращает {"pdf": bytes|None, "preview_png": bytes|None}:
+      • pdf         — полное решение (векторное, многостраничное);
+      • preview_png — PNG-превью первой страницы (для инлайн-показа в чате).
+    Оба None, если рендер не удался.
+    """
+    empty = {"pdf": None, "preview_png": None}
     if not latex_content or len(latex_content.strip()) < 10:
         logger.warning("LaTeX content empty")
-        return None
+        return empty
 
     h = _content_hash(latex_content)
-    cached = CACHE_DIR / f"{h}.png"
-    if cached.exists():
-        logger.info(f"PNG cache HIT: {h}")
-        return cached.read_bytes()
+    pdf_path = CACHE_DIR / f"{h}.pdf"
+    png_path = CACHE_DIR / f"{h}.png"
+    if pdf_path.exists() and png_path.exists():
+        logger.info(f"render cache HIT: {h}")
+        return {"pdf": pdf_path.read_bytes(), "preview_png": png_path.read_bytes()}
 
-    logger.info(f"PNG render START: {h}, {len(latex_content)} chars")
-    ok = await asyncio.to_thread(_compile_sync, latex_content, cached)
+    logger.info(f"render START: {h}, {len(latex_content)} chars")
+    ok = await asyncio.to_thread(_compile_sync, latex_content, pdf_path, png_path)
     if not ok:
-        return None
+        return empty
 
-    data = cached.read_bytes()
-    logger.info(f"PNG render DONE: {h}, {len(data)/1024:.0f}KB")
-    return data
+    pdf_bytes = pdf_path.read_bytes()
+    png_bytes = png_path.read_bytes()
+    logger.info(
+        f"render DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB, png={len(png_bytes)/1024:.0f}KB"
+    )
+    return {"pdf": pdf_bytes, "preview_png": png_bytes}

@@ -39,7 +39,7 @@ from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
-from app.render.latex_to_png import render_latex_to_png
+from app.render.latex_to_png import render_solution
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
 RAG_MIN_SIMILARITY = 0.65
@@ -130,8 +130,8 @@ async def solve_task_from_photo(
         )
         latex_clean = _clean_latex(latex_raw)
         await _status(on_status, "🖼 Оформляю решение…")
-        png = await render_latex_to_png(latex_clean)
-        return {"latex": latex_clean, "png": png}
+        rendered = await render_solution(latex_clean)
+        return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
     # 4) Классификация темы (для фильтрации retrieval)
     topic = classify_topic(condition_text)
@@ -169,8 +169,8 @@ async def solve_task_from_photo(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            png = await render_latex_to_png(cached_latex)
-            return {"latex": cached_latex, "png": png}
+            rendered = await render_solution(cached_latex)
+            return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
         else:
             logger.info(
                 f"Cache hit rejected (legacy HTML format): sim={hit['cosine_sim']:.3f} "
@@ -209,12 +209,15 @@ async def solve_task_from_photo(
     except Exception as e:
         logger.warning(f"save_solution failed (non-fatal): {e}")
 
-    # 9) Рендер PNG (с кэшем по hash содержимого)
+    # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого)
     await _status(on_status, "🖼 Оформляю решение…")
-    png = await render_latex_to_png(latex_clean)
+    rendered = await render_solution(latex_clean)
 
-    logger.info(f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, png={'OK' if png else 'FAIL'}")
-    return {"latex": latex_clean, "png": png}
+    logger.info(
+        f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, "
+        f"pdf={'OK' if rendered['pdf'] else 'FAIL'}"
+    )
+    return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
 
 def is_complex_task(task_text: str) -> bool:
