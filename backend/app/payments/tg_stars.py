@@ -75,64 +75,91 @@ async def on_pre_checkout(query: PreCheckoutQuery, bot: Bot):
 
 @router.message(F.successful_payment)
 async def on_successful_payment(message: Message):
-    """Платёж прошёл — активируем покупку + лог в payments."""
+    """Платёж прошёл — активируем покупку. Идемпотентно по charge_id.
+
+    Начисление и запись в payments — в одной транзакции: сначала «столбим»
+    платёж (INSERT ... ON CONFLICT DO NOTHING RETURNING id), и только если
+    вставка реально произошла — начисляем. Дубль вебхука от Telegram второй
+    раз ничего не начислит.
+    """
     sp = message.successful_payment
     user_id = message.from_user.id
     payload = sp.invoice_payload
+    charge_id = sp.telegram_payment_charge_id
 
     logger.info(
         f"💎 paid: user={user_id} payload={payload} "
-        f"amount={sp.total_amount} {sp.currency} charge_id={sp.telegram_payment_charge_id}"
+        f"amount={sp.total_amount} {sp.currency} charge_id={charge_id}"
     )
 
+    if payload not in (PAYLOAD_PREMIUM, PAYLOAD_PACK):
+        logger.error(f"successful_payment with unknown payload: {payload}")
+        await message.answer("Платёж прошёл, но мы не смогли распознать что куплено. Напиши в @Academ4I_support.")
+        return
+
+    product = "premium_30d" if payload == PAYLOAD_PREMIUM else f"pack_{settings.pack_tasks}"
+
+    premium_until = None
+    new_credits = None
+    duplicate = False
+
+    async with get_session() as session:
+        # 1) Идемпотентный «захват» платежа по уникальному charge_id.
+        claim = await session.execute(text("""
+            INSERT INTO payments (
+                telegram_id, telegram_payment_charge_id, amount_stars,
+                product, premium_from, premium_until, status
+            ) VALUES (:tg, :charge, :amt, :product, NOW(), NOW(), 'processing')
+            ON CONFLICT (telegram_payment_charge_id) DO NOTHING
+            RETURNING id
+        """), {"tg": user_id, "charge": charge_id, "amt": sp.total_amount, "product": product})
+        claimed = claim.first()
+
+        if claimed is None:
+            # Этот платёж уже обрабатывали — повторно НЕ начисляем.
+            duplicate = True
+        else:
+            payment_id = claimed[0]
+            # 2) Начисление в той же транзакции, что и запись платежа.
+            if payload == PAYLOAD_PREMIUM:
+                premium_until = await activate_premium(
+                    user_id, duration_days=settings.premium_duration_days, session=session,
+                )
+                await session.execute(text(
+                    "UPDATE payments SET premium_until = :until, status = 'succeeded' WHERE id = :id"
+                ), {"until": premium_until, "id": payment_id})
+            else:  # PAYLOAD_PACK
+                new_credits = await add_credits(user_id, settings.pack_tasks, session=session)
+                await session.execute(text(
+                    "UPDATE payments SET status = 'succeeded' WHERE id = :id"
+                ), {"id": payment_id})
+            await session.commit()
+
+    if duplicate:
+        logger.warning(f"Duplicate successful_payment ignored: user={user_id} charge_id={charge_id}")
+        kb = main_menu_keyboard(is_admin=is_admin(message.from_user.username))
+        await message.answer(
+            "✅ Этот платёж уже был активирован ранее — повторно начислять не нужно.",
+            reply_markup=kb,
+        )
+        return
+
     if payload == PAYLOAD_PREMIUM:
-        premium_until = await activate_premium(user_id, duration_days=settings.premium_duration_days)
-        product = "premium_30d"
         result_text = (
             f"✅ <b>Premium активирован!</b>\n\n"
             f"Безлимит решений до <b>{premium_until.strftime('%d.%m.%Y %H:%M UTC')}</b>.\n\n"
             f"Кидай задачи 🎓"
         )
-    elif payload == PAYLOAD_PACK:
-        new_credits = await add_credits(user_id, settings.pack_tasks)
-        product = f"pack_{settings.pack_tasks}"
-        premium_until = None
+        is_premium_now = True
+    else:
         result_text = (
             f"✅ <b>Пакет {settings.pack_tasks} задач куплен!</b>\n\n"
             f"Доступно решений: <b>{new_credits}</b> (без срока истечения).\n\n"
             f"Кидай задачи 🎓"
         )
-    else:
-        logger.error(f"successful_payment with unknown payload: {payload}")
-        await message.answer("Платёж прошёл, но мы не смогли распознать что куплено. Напиши в @Academ4I_support.")
-        return
+        is_premium_now = False
 
-    # Лог платежа
-    try:
-        async with get_session() as session:
-            sql = """
-                INSERT INTO payments (
-                    telegram_id, telegram_payment_charge_id, amount_stars,
-                    product, premium_from, premium_until, status
-                ) VALUES (
-                    :tg, :charge, :amt, :product, NOW(),
-                    COALESCE(:until, NOW()), 'succeeded'
-                ) ON CONFLICT (telegram_payment_charge_id) DO NOTHING
-            """
-            await session.execute(text(sql), {
-                "tg": user_id,
-                "charge": sp.telegram_payment_charge_id,
-                "amt": sp.total_amount,
-                "product": product,
-                "until": premium_until,
-            })
-            await session.commit()
-    except Exception as e:
-        logger.exception(f"payment log failed (non-fatal): {e}")
-
-    # После Premium-покупки обновляем клавиатуру (без кнопок покупки).
-    # После пакета — оставляем обычное меню (юзер может ещё купить).
-    is_premium_now = payload == PAYLOAD_PREMIUM
+    # После Premium-покупки — клавиатура без кнопок покупки; после пакета — обычное меню.
     kb = main_menu_keyboard(
         is_premium=is_premium_now,
         is_admin=is_admin(message.from_user.username),

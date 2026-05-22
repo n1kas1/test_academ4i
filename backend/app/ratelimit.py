@@ -2,11 +2,11 @@
 
 Админы (settings.admin_usernames_set) обходят все лимиты — безлимит решений.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.config import settings
 from app.core.db import get_session
@@ -170,58 +170,89 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
 async def consume_quota(telegram_id: int, username: Optional[str] = None) -> None:
     """Инкрементировать total_solved и списать одну единицу квоты.
     Порядок списания: premium (ничего) → credits → free_used.
+
+    Списание атомарно — одним UPDATE с CASE-выражениями. Все ветки CASE
+    вычисляются против ТЕКУЩИХ значений строки (Postgres так считает SET),
+    плюс строка блокируется на время апдейта — поэтому параллельные запросы
+    не теряют декремент и не уводят credits в минус.
     """
     if is_admin(username):
         return
 
+    # NULL premium_until: `NULL > NOW()` → NULL → ветка не матчится → идём дальше
+    # (т.е. отсутствие подписки трактуется как "не premium"). Это и нужно.
+    sql = text("""
+        UPDATE users SET
+            total_solved = total_solved + 1,
+            credits = CASE
+                WHEN premium_until > NOW() THEN credits
+                WHEN credits > 0 THEN credits - 1
+                ELSE credits END,
+            free_used = CASE
+                WHEN premium_until > NOW() THEN free_used
+                WHEN credits > 0 THEN free_used
+                ELSE free_used + 1 END
+        WHERE telegram_id = :tg
+    """)
+    async with get_session() as session:
+        await session.execute(sql, {"tg": telegram_id})
+        await session.commit()
+
+
+async def _apply_credits(session, telegram_id: int, amount: int) -> int:
+    """Начислить credits в рамках переданной сессии. Коммитит вызывающий."""
+    stmt = select(User).where(User.telegram_id == telegram_id)
+    user = (await session.execute(stmt)).scalar_one_or_none()
+    if user is None:
+        user = User(telegram_id=telegram_id, credits=amount)
+        session.add(user)
+        await session.flush()
+        return amount
+    user.credits += amount
+    await session.flush()
+    return user.credits
+
+
+async def add_credits(telegram_id: int, amount: int, session=None) -> int:
+    """Начислить N задач юзеру (после оплаты пакета). Возвращает новое значение credits.
+
+    Если передана session — работает в ней без коммита (коммитит вызывающий,
+    чтобы начисление было атомарно с записью платежа). Иначе — своя транзакция.
+    """
+    if session is not None:
+        return await _apply_credits(session, telegram_id, amount)
+    async with get_session() as s:
+        result = await _apply_credits(s, telegram_id, amount)
+        await s.commit()
+        logger.info(f"Credits +{amount} for {telegram_id}, total={result}")
+        return result
+
+
+async def _apply_premium(session, telegram_id: int, duration_days: int) -> datetime:
+    """Активировать/продлить Premium в рамках переданной сессии. Коммитит вызывающий."""
     now = datetime.now(timezone.utc)
-    async with get_session() as session:
-        stmt = select(User).where(User.telegram_id == telegram_id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-        if user is None:
-            return
-        user.total_solved += 1
-        if not user.has_premium(now):
-            if user.credits > 0:
-                user.credits -= 1
-            else:
-                user.free_used += 1
-        await session.commit()
+    stmt = select(User).where(User.telegram_id == telegram_id)
+    user = (await session.execute(stmt)).scalar_one_or_none()
+    if user is None:
+        # Юзера ещё нет — создаём заглушку. Должен быть редкий случай.
+        user = User(telegram_id=telegram_id)
+        session.add(user)
+    # Активная подписка → продлеваем от premium_until; иначе → от текущего момента.
+    base = user.premium_until if user.premium_until and user.premium_until > now else now
+    user.premium_until = base + timedelta(days=duration_days)
+    await session.flush()
+    return user.premium_until
 
 
-async def add_credits(telegram_id: int, amount: int) -> int:
-    """Начислить N задач юзеру (после оплаты пакета). Возвращает новое значение credits."""
-    async with get_session() as session:
-        stmt = select(User).where(User.telegram_id == telegram_id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-        if user is None:
-            user = User(telegram_id=telegram_id, credits=amount)
-            session.add(user)
-        else:
-            user.credits += amount
-        await session.commit()
-        await session.refresh(user)
-        logger.info(f"Credits +{amount} for {telegram_id}, total={user.credits}")
-        return user.credits
+async def activate_premium(telegram_id: int, duration_days: int = 30, session=None) -> datetime:
+    """Активировать/продлить Premium юзера. Возвращает новую дату окончания.
 
-
-async def activate_premium(telegram_id: int, duration_days: int = 30) -> datetime:
-    """Активировать/продлить Premium юзера. Возвращает новую дату окончания."""
-    from datetime import timedelta
-    now = datetime.now(timezone.utc)
-    async with get_session() as session:
-        stmt = select(User).where(User.telegram_id == telegram_id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-        if user is None:
-            # Юзера ещё нет — создаём заглушку. Должен быть редкий случай.
-            user = User(telegram_id=telegram_id)
-            session.add(user)
-
-        # Если уже есть активная подписка — продлеваем от premium_until.
-        # Если нет — от текущего момента.
-        base = user.premium_until if user.premium_until and user.premium_until > now else now
-        user.premium_until = base + timedelta(days=duration_days)
-        await session.commit()
-        await session.refresh(user)
-        logger.info(f"Premium activated: {telegram_id} until {user.premium_until}")
-        return user.premium_until
+    Если передана session — работает в ней без коммита (см. add_credits).
+    """
+    if session is not None:
+        return await _apply_premium(session, telegram_id, duration_days)
+    async with get_session() as s:
+        result = await _apply_premium(s, telegram_id, duration_days)
+        await s.commit()
+        logger.info(f"Premium activated: {telegram_id} until {result}")
+        return result
