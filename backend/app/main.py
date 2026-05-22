@@ -6,6 +6,7 @@
 Webhook от Telegram приходит на POST /webhook,
 секрет проверяется через X-Telegram-Bot-Api-Secret-Token.
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,7 @@ from app.bot import handlers
 from app.payments import tg_stars
 from app.core.db import close_db, init_db
 from app.core.redis import close_redis, init_redis
+from app.premium_notify import premium_notifier_loop
 
 # === Aiogram setup ===
 bot = Bot(
@@ -56,9 +58,17 @@ async def lifespan(app: FastAPI):
             f"App continues; reinstall webhook later if needed."
         )
 
+    # Фоновые уведомления о Premium (скоро закончится / закончился).
+    notifier_task = asyncio.create_task(premium_notifier_loop(bot))
+
     yield
 
     logger.info("Shutting down...")
+    notifier_task.cancel()
+    try:
+        await notifier_task
+    except asyncio.CancelledError:
+        pass
     await bot.delete_webhook()
     await bot.session.close()
     await close_db()

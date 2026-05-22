@@ -567,6 +567,17 @@ async def handle_resolve(callback: CallbackQuery, bot: Bot):
             await callback.message.answer(MSG_ERROR)
 
 
+@router.callback_query(F.data == "renew_premium")
+async def handle_renew_premium(callback: CallbackQuery, bot: Bot):
+    """Кнопка «Продлить Premium» из уведомления об окончании подписки."""
+    if is_admin(callback.from_user.username):
+        await callback.answer("👑 У тебя безлимит как у админа.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(MSG_BUY_PREMIUM_PROMPT)
+    await send_premium_invoice(bot, chat_id=callback.message.chat.id)
+
+
 @router.message(F.text)
 async def handle_text(message: Message):
     """Любой текст не из меню — подсказка."""

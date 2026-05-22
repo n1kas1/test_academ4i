@@ -54,6 +54,13 @@ def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def renew_premium_keyboard() -> InlineKeyboardMarkup:
+    """Inline-кнопка под уведомлением об окончании Premium."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💎 Продлить Premium", callback_data="renew_premium"),
+    ]])
+
+
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:
     """Inline-выбор: какую из нескольких задач на фото решить.
 

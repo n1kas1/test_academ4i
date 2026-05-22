@@ -94,6 +94,17 @@ MSG_ADMIN_WELCOME = (
 )
 
 
+MSG_PREMIUM_EXPIRING = (
+    "⏳ Твой <b>Premium</b> заканчивается совсем скоро.\n\n"
+    "Продли, чтобы не потерять безлимит на задачи 💎"
+)
+
+MSG_PREMIUM_EXPIRED = (
+    "📅 Твой <b>Premium</b> закончился.\n\n"
+    "Спасибо, что пользовался! Продли в один тап — и снова безлимит 💎"
+)
+
+
 MSG_BUY_PACK_PROMPT = (
     f"🎁 <b>Пакет {settings.pack_tasks} задач</b>\n\n"
     f"✓ {settings.pack_tasks} решений сверх бесплатных\n"
