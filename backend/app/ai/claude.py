@@ -5,6 +5,8 @@
 2. solve_with_claude_vision — главный solver с extended thinking + RAG-контекстом
 """
 import html
+import json
+import re
 
 from anthropic import AsyncAnthropic
 from loguru import logger
@@ -30,45 +32,80 @@ def get_client() -> AsyncAnthropic:
 
 OCR_SYSTEM = """Ты — OCR-распознаватель математических задач.
 На фото — задача (или несколько) из учебника/задачника по высшей математике на русском.
-Распознай условие нужной задачи и верни его одним абзацем.
-Формулы пиши в LaTeX внутри $...$.
 
-ВАЖНО — обработка нескольких задач:
+Верни СТРОГО JSON (без markdown-обёртки, без пояснений) вида:
+{
+  "condition": "<текст условия НУЖНОЙ задачи одним абзацем, формулы в $...$>",
+  "task_ids": ["<номера ВСЕХ отдельных задач, что видишь на фото>"]
+}
+
+Правила для "condition":
 - Если на фото ОДНА задача (даже с подзадачами а/б/в) — распознай её полностью.
-- Если на фото НЕСКОЛЬКО задач:
-  * Если в подсказке от студента указан номер ("задача 2851", "№3.14", "пример 5") —
-    распознай ИМЕННО эту задачу.
-  * Если в подсказке указана подзадача ("а)", "пункт б", "в 2851 в)") —
-    распознай условие нужной подзадачи (включая общую формулировку задачи если есть).
-  * Если подсказка пустая — распознай ПЕРВУЮ задачу.
+- Если НЕСКОЛЬКО задач и в подсказке студента указан номер ("задача 2851", "№3.14",
+  "пример 5") — распознай ИМЕННО её. Если указана подзадача ("а)", "2851 в)") —
+  распознай нужную подзадачу (с общей формулировкой задачи, если есть).
+- Если несколько задач и подсказка пустая — распознай ПЕРВУЮ задачу.
 
-Никаких пояснений, никаких "Условие:" в начале — просто текст условия."""
+Правила для "task_ids":
+- Это номера ОТДЕЛЬНЫХ задач (например ["2851", "2852"]), а НЕ подпункты а/б/в.
+- Если задача одна — верни список с одним номером (или [] если номера не видно).
+- Перечисли только реально видимые на фото номера, по порядку."""
+
+
+def _parse_ocr_json(raw: str) -> tuple[str, list[str]]:
+    """Парсит JSON-ответ OCR. Устойчив к code-fence и мусору вокруг."""
+    text = raw.strip()
+    # снять возможную ```json ... ``` обёртку
+    text = re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", text, flags=re.IGNORECASE).strip()
+    # выдрать первый {...} блок если есть лишний текст
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        text = m.group(0)
+    try:
+        data = json.loads(text)
+        condition = (data.get("condition") or "").strip()
+        ids_raw = data.get("task_ids") or []
+        # нормализуем: строки, без пустых, без дублей, сохраняя порядок
+        seen = set()
+        task_ids = []
+        for x in ids_raw:
+            s = str(x).strip()
+            if s and s not in seen:
+                seen.add(s)
+                task_ids.append(s)
+        return condition, task_ids
+    except Exception:
+        # не JSON — трактуем весь ответ как условие, номеров не знаем
+        return raw.strip(), []
 
 
 async def extract_condition_text(
     image_b64: str,
     media_type: str,
     user_hint: str = "",
-) -> str:
-    """Лёгкий vision-вызов для распознавания условия задачи.
-    Используется для эмбеддинга и retrieval-фильтрации.
+) -> tuple[str, list[str]]:
+    """Лёгкий vision-вызов: распознаёт условие нужной задачи + список номеров
+    всех задач на фото.
 
-    user_hint — что юзер написал в caption к фото
-    (например "реши 2851 а)" или "пример 3"). Помогает выбрать нужную задачу на фото.
+    Возвращает (condition_text, task_ids). task_ids нужен, чтобы при нескольких
+    задачах без подсказки спросить у юзера, какую решать.
+
+    user_hint — что юзер написал в caption к фото (например "реши 2851 а)").
     """
     client = get_client()
 
-    user_text = "Распознай условие задачи."
+    user_text = "Распознай условие и перечисли номера задач на фото. Верни JSON."
     if user_hint:
         user_text = (
             f"Студент написал: \"{user_hint}\".\n"
-            f"С учётом этого распознай условие НУЖНОЙ задачи/подзадачи с фото."
+            f"С учётом этого распознай условие НУЖНОЙ задачи/подзадачи. "
+            f"Также перечисли номера всех задач на фото. Верни JSON."
         )
 
     try:
         response = await client.messages.create(
-            model=settings.claude_model,
-            max_tokens=600,
+            model=settings.ocr_model,
+            max_tokens=700,
             system=OCR_SYSTEM,
             messages=[{
                 "role": "user",
@@ -80,17 +117,19 @@ async def extract_condition_text(
                 ],
             }],
         )
+        raw = ""
         for block in response.content:
             if block.type == "text":
-                text = block.text.strip()
-                logger.info(
-                    f"OCR extract: in={response.usage.input_tokens}, "
-                    f"out={response.usage.output_tokens}, len={len(text)}"
-                )
-                return text
+                raw += block.text
+        condition, task_ids = _parse_ocr_json(raw)
+        logger.info(
+            f"OCR extract: in={response.usage.input_tokens}, "
+            f"out={response.usage.output_tokens}, len={len(condition)}, task_ids={task_ids}"
+        )
+        return condition, task_ids
     except Exception as e:
         logger.warning(f"OCR extract failed: {e}")
-    return ""
+    return "", []
 
 
 # ───────────────────────────────────────────────────────────────────────

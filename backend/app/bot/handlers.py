@@ -5,13 +5,16 @@ Routing:
   фото → check_quota → pipeline → PNG + LaTeX button → consume_quota
   Кнопки меню (BTN_*) — переход на покупку или /balance / /help
 """
+import json
 import secrets
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     Message,
 )
 from loguru import logger
@@ -24,17 +27,20 @@ from app.bot.keyboards import (
     BTN_HELP,
     latex_view_keyboard,
     main_menu_keyboard,
+    task_choice_keyboard,
 )
 from app.bot.messages import (
     MSG_ADMIN_WELCOME,
     MSG_BUY_PACK_PROMPT,
     MSG_BUY_PREMIUM_PROMPT,
+    MSG_DEMO_CAPTION,
     MSG_ERROR,
     MSG_HELP,
     MSG_PROCESSING,
     MSG_QUOTA_EXCEEDED,
     MSG_START,
     msg_balance,
+    msg_choose_task,
 )
 from app.config import settings
 from app.core.redis import get_redis
@@ -49,6 +55,10 @@ from app.ratelimit import (
 
 router = Router()
 LATEX_TTL_SECONDS = 3600
+TASKPICK_TTL_SECONDS = 3600
+
+# Демо-картинка решения для /start (статический ассет).
+_DEMO_PATH = Path(__file__).parent / "assets" / "demo_solution.png"
 
 
 # ─────────────────────── команды ───────────────────────
@@ -71,6 +81,15 @@ async def cmd_start(message: Message):
     kb, _ = await _menu_kb(user.id, user.username)
     prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
     await message.answer(prefix + MSG_START, reply_markup=kb)
+
+    # Демо-пример решения — чтобы юзер сразу понял что делать (кинуть фото).
+    if _DEMO_PATH.exists():
+        try:
+            await message.answer_photo(FSInputFile(_DEMO_PATH), caption=MSG_DEMO_CAPTION)
+        except Exception as e:
+            logger.warning(f"demo photo send failed (non-fatal): {e}")
+    else:
+        logger.warning(f"demo image not found at {_DEMO_PATH}")
 
 
 @router.message(Command("menu"))
@@ -167,6 +186,57 @@ async def _send_balance(message: Message):
 
 # ─────────────────────── фото → решение ───────────────────────
 
+async def _download_photo(bot: Bot, file_id: str) -> bytes:
+    """Скачать фото из Telegram по file_id."""
+    file = await bot.get_file(file_id)
+    photo_io = await bot.download_file(file.file_path)
+    return photo_io.read() if hasattr(photo_io, "read") else photo_io
+
+
+def _make_status_cb(processing_msg: Message):
+    """Колбэк прогресс-статуса: редактирует одно и то же сообщение по стадиям."""
+    async def cb(text: str):
+        try:
+            await processing_msg.edit_text(text)
+        except Exception:
+            # "message is not modified" и прочие — не критичны
+            pass
+    return cb
+
+
+async def _send_solution_result(
+    bot: Bot, chat_id: int, processing_msg: Message, result: dict,
+    quota, user_id: int, username: str | None,
+) -> None:
+    """Доставить готовое решение (PNG + кнопка LaTeX) и списать квоту."""
+    latex_text = result.get("latex", "")
+    png_bytes = result.get("png")
+
+    if not png_bytes:
+        logger.warning(f"PNG render failed for user {user_id}")
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+        for ch in _split_for_telegram(latex_text or "Не удалось получить решение."):
+            await bot.send_message(chat_id, f"<pre>{_escape_html(ch)}</pre>")
+    else:
+        token = secrets.token_urlsafe(8)
+        await get_redis().set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+        await bot.send_photo(
+            chat_id,
+            photo=BufferedInputFile(png_bytes, filename="solution.png"),
+            caption=_build_solution_caption(quota),
+            reply_markup=latex_view_keyboard(token),
+        )
+
+    await consume_quota(user_id, username=username)
+
+
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     user = message.from_user
@@ -189,41 +259,41 @@ async def handle_photo(message: Message, bot: Bot):
         await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
         return
 
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    photo_io = await bot.download_file(file.file_path)
-    photo_bytes = photo_io.read() if hasattr(photo_io, "read") else photo_io
+    file_id = message.photo[-1].file_id
     caption = (message.caption or "").strip()
+    photo_bytes = await _download_photo(bot, file_id)
 
     processing_msg = await message.answer(MSG_PROCESSING)
 
     try:
         result = await solve_task_from_photo(
             photo_bytes, user_id=user_id, user_hint=caption,
+            on_status=_make_status_cb(processing_msg),
         )
-        latex_text = result.get("latex", "")
-        png_bytes = result.get("png")
 
-        if not png_bytes:
-            logger.warning(f"PNG render failed for user {user_id}")
-            await processing_msg.delete()
-            chunks = _split_for_telegram(latex_text or "Не удалось получить решение.")
-            for ch in chunks:
-                await message.answer(f"<pre>{_escape_html(ch)}</pre>", parse_mode="HTML")
-        else:
+        # Несколько задач на фото и подписи нет → спрашиваем какую решать.
+        # Квоту НЕ списываем — решения ещё не было.
+        if result.get("needs_choice"):
+            task_ids = result["task_ids"]
             token = secrets.token_urlsafe(8)
-            redis = get_redis()
-            await redis.set(f"latex:{token}", latex_text, ex=LATEX_TTL_SECONDS)
-
-            cap_text = _build_solution_caption(quota)
-            await processing_msg.delete()
-            await message.answer_photo(
-                photo=BufferedInputFile(png_bytes, filename="solution.png"),
-                caption=cap_text,
-                reply_markup=latex_view_keyboard(token),
+            await get_redis().set(
+                f"taskpick:{token}",
+                json.dumps({"file_id": file_id, "task_ids": task_ids}),
+                ex=TASKPICK_TTL_SECONDS,
             )
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            await message.answer(
+                msg_choose_task(task_ids),
+                reply_markup=task_choice_keyboard(token, task_ids),
+            )
+            return
 
-        await consume_quota(user_id, username=username)
+        await _send_solution_result(
+            bot, message.chat.id, processing_msg, result, quota, user_id, username,
+        )
 
     except Exception as e:
         logger.exception(f"Pipeline error for user {user_id}: {e}")
@@ -231,6 +301,78 @@ async def handle_photo(message: Message, bot: Bot):
             await processing_msg.edit_text(MSG_ERROR)
         except Exception:
             await message.answer(MSG_ERROR)
+
+
+@router.callback_query(F.data.startswith("pick:"))
+async def handle_pick_task(callback: CallbackQuery, bot: Bot):
+    """Юзер выбрал, какую из нескольких задач на фото решить."""
+    user = callback.from_user
+    user_id = user.id
+    username = user.username
+
+    parts = callback.data.split(":")  # ["pick", token, idx]
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    token, idx_str = parts[1], parts[2]
+
+    raw = await get_redis().get(f"taskpick:{token}")
+    if not raw:
+        await callback.answer(
+            "Выбор устарел (хранится 1 час). Пришли фото снова.", show_alert=True,
+        )
+        return
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)
+    task_ids = data.get("task_ids", [])
+    file_id = data.get("file_id")
+
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        idx = 0
+    if not (0 <= idx < len(task_ids)) or not file_id:
+        await callback.answer("Что-то пошло не так, пришли фото снова.", show_alert=True)
+        return
+    chosen = task_ids[idx]
+
+    # Лимиты/квота проверяем на момент выбора.
+    if not await check_rate_limit(user_id):
+        await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
+        return
+    quota = await check_quota(user_id, username=username)
+    if not quota.allowed:
+        await callback.answer()
+        kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
+        await callback.message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
+        return
+
+    await callback.answer()  # убрать "часики" на кнопке
+    await get_redis().delete(f"taskpick:{token}")  # выбор одноразовый
+
+    # Сообщение-вопрос превращаем в статус-сообщение (убираем кнопки).
+    processing_msg = callback.message
+    try:
+        await processing_msg.edit_text(f"✅ Решаю задачу <b>№{chosen}</b>…")
+    except Exception:
+        processing_msg = await callback.message.answer(MSG_PROCESSING)
+
+    try:
+        photo_bytes = await _download_photo(bot, file_id)
+        result = await solve_task_from_photo(
+            photo_bytes, user_id=user_id, user_hint=f"реши задачу №{chosen}",
+            on_status=_make_status_cb(processing_msg),
+        )
+        await _send_solution_result(
+            bot, callback.message.chat.id, processing_msg, result, quota, user_id, username,
+        )
+    except Exception as e:
+        logger.exception(f"Pick-task pipeline error for user {user_id}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_ERROR)
+        except Exception:
+            await callback.message.answer(MSG_ERROR)
 
 
 def _build_solution_caption(quota) -> str:

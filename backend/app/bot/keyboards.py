@@ -43,3 +43,21 @@ def latex_view_keyboard(latex_token: str) -> InlineKeyboardMarkup:
             callback_data=f"latex:{latex_token}",
         ),
     ]])
+
+
+def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:
+    """Inline-выбор: какую из нескольких задач на фото решить.
+
+    callback_data = "pick:{token}:{index}" — index указывает на task_ids[index],
+    сами номера хранятся в Redis под token (в callback_data не влезут много).
+    """
+    rows = []
+    row = []
+    for i, tid in enumerate(task_ids):
+        row.append(InlineKeyboardButton(text=f"№{tid}", callback_data=f"pick:{token}:{i}"))
+        if len(row) == 3:          # по 3 кнопки в ряд
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)

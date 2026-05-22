@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     anthropic_base_url: str = "https://api.proxyapi.ru/anthropic"
     claude_model: str = "claude-sonnet-4-6"
     claude_use_extended_thinking: bool = True
+    # Модель лёгкого OCR-прохода (распознать условие + номера задач).
+    # По умолчанию = основная; можно удешевить на claude-haiku-4-5-20251001 через .env.
+    ocr_model: str = "claude-sonnet-4-6"
 
     # === OpenAI — через ProxyAPI (для эмбеддингов и парсинга PDF) ===
     openai_api_key: str
