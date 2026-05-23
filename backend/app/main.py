@@ -18,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from loguru import logger
 
 from app.config import settings
-from app.bot import handlers
+from app.bot import admin, handlers
 from app.payments import tg_stars
 from app.core.db import close_db, init_db
 from app.core.redis import close_redis, init_redis
@@ -33,6 +33,7 @@ dp = Dispatcher()
 # payments router идёт ПЕРВЫМ — чтобы pre_checkout_query и successful_payment
 # ловились ДО обработчика photo/text сообщений
 dp.include_router(tg_stars.router)
+dp.include_router(admin.router)
 dp.include_router(handlers.router)
 
 
