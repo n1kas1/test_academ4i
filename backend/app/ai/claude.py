@@ -26,12 +26,12 @@ def get_client() -> AsyncAnthropic:
     return _client
 
 
-# Приблизительная стоимость токенов в ₽ за 1M (вход / выход). Грубый ориентир
-# для логов — КАЛИБРУЙ под реальные списания ProxyAPI (markup + курс).
-# Картинки vision считаются как входные токены; thinking — как выходные.
+# Стоимость токенов в ₽ за 1M (вход / выход). Откалибровано 2026-05-23 под факт
+# ProxyAPI: thinking-задача in=4709/out=5000 списала ~14₽ → ставки ×~1.65 от
+# базовых Anthropic-цен. Картинки vision = входные токены; thinking = выходные.
 _RUB_PER_MTOK = {
-    "haiku":  (90, 450),     # ~$1/$5 при ~90₽/$
-    "sonnet": (270, 1350),   # ~$3/$15
+    "haiku":  (150, 750),
+    "sonnet": (450, 2250),
 }
 
 
@@ -292,10 +292,10 @@ async def solve_with_claude_vision(
     # Router thinking: явный параметр > дефолт из settings
     thinking_on = use_thinking if use_thinking is not None else settings.claude_use_extended_thinking
     if thinking_on:
-        # Budget 2500 (снижено с 8000) — хватает на доказательства,
-        # экономия ~60% на токенах thinking. Для простых задач — без thinking совсем.
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 2500}
-        kwargs["max_tokens"] = 5000
+        # Budget 1500 (снижено с 2500) + max_tokens 4000 (с 5000): на доказательства
+        # хватает, место под ответ (~2500) сохраняется, экономия на токенах thinking.
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": 1500}
+        kwargs["max_tokens"] = 4000
 
     response = await client.messages.create(**kwargs)
 
