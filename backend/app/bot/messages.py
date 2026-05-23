@@ -5,6 +5,11 @@ from typing import Optional
 from app.config import settings
 
 
+def _fmt_dt(dt: datetime) -> str:
+    """Компактная дата-время для уведомлений (UTC)."""
+    return dt.strftime("%d.%m в %H:%M UTC")
+
+
 MSG_START = (
     "👋 Привет! Я <b>Academ4I</b> — решаю задачи по матану, линалу, алгебре, "
     "теорверу и дискретной математике.\n\n"
@@ -60,7 +65,7 @@ def msg_quota_exceeded(resets_at: Optional[datetime] = None) -> str:
     if resets_at is not None:
         when = (
             f"🔄 Следующие {settings.free_tasks_per_week} — "
-            f"<b>{resets_at.strftime('%d.%m в %H:%M UTC')}</b>.\n\n"
+            f"<b>{_fmt_dt(resets_at)}</b>.\n\n"
         )
     return (
         f"⛔ Бесплатные <b>{settings.free_tasks_per_week} задачи на неделю</b> исчерпаны.\n\n"
@@ -99,7 +104,7 @@ def msg_balance(quota) -> str:
         f"🆓 Бесплатных осталось: <b>{quota.free_remaining}/{settings.free_tasks_per_week}</b> в неделю"
     )
     if quota.free_remaining < settings.free_tasks_per_week and quota.free_resets_at:
-        lines.append(f"🔄 Обновится: <b>{quota.free_resets_at.strftime('%d.%m в %H:%M UTC')}</b>")
+        lines.append(f"🔄 Обновится: <b>{_fmt_dt(quota.free_resets_at)}</b>")
     if quota.total_remaining == 0:
         lines.append("")
         lines.append("Чтобы продолжить — выбери в меню пакет или Premium 👇")

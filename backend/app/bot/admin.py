@@ -4,10 +4,9 @@
 - меню: 📊 Статистика / 📢 Рассылка
 - статистика: переключатель периода (сегодня / 7 / 30 дней), пересчёт по кнопке
 """
-import asyncio
-
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, Filter
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -16,17 +15,24 @@ from aiogram.types import (
 )
 from sqlalchemy import text
 
+from app.core.background import spawn
 from app.core.db import get_session
 from app.core.redis import get_redis
 from app.notify import broadcast_send
 from app.ratelimit import is_admin
 
+
+class IsAdmin(Filter):
+    """Пускает только админов. Не-админ → апдейт уходит дальше по роутерам."""
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return bool(event.from_user and is_admin(event.from_user.username))
+
+
 router = Router()
+router.message.filter(IsAdmin())
+router.callback_query.filter(IsAdmin())
 
 _BROADCAST_TTL_SEC = 600  # черновик рассылки живёт 10 минут
-
-# Держим ссылки на фоновые задачи рассылки, чтобы их не собрал GC до завершения.
-_broadcast_tasks: set[asyncio.Task] = set()
 
 # Периоды переключателя статистики: дни → подпись.
 _PERIODS = ((1, "сегодня"), (7, "7 дней"), (30, "30 дней"))
@@ -37,8 +43,14 @@ def _broadcast_key(admin_id: int) -> str:
 
 
 def _pct_suffix(part: int, whole: int) -> str:
-    """' (NN%)' от предыдущего шага воронки; пусто, если делить не на что."""
-    return f" ({round(100 * part / whole)}%)" if whole else ""
+    """' (NN%)' от предыдущего шага воронки; пусто, если делить не на что.
+
+    Клампим до 100%: когорты пересекаются — событие start логируется только с
+    момента деплоя аналитики, поэтому «решивших» может оказаться больше «стартовавших».
+    """
+    if not whole:
+        return ""
+    return f" ({min(100, round(100 * part / whole))}%)"
 
 
 # === Клавиатуры ===
@@ -115,16 +127,11 @@ async def _render_stats(days: int) -> str:
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.username):
-        return
     await message.answer("🛠 <b>Админ-панель</b>\nВыбери раздел 👇", reply_markup=_menu_kb())
 
 
 @router.callback_query(F.data == "admin:menu")
 async def admin_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     await callback.answer()
     await callback.message.edit_text(
         "🛠 <b>Админ-панель</b>\nВыбери раздел 👇", reply_markup=_menu_kb()
@@ -133,25 +140,17 @@ async def admin_menu(callback: CallbackQuery):
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    if not is_admin(message.from_user.username):
-        return
     await message.answer(await _render_stats(7), reply_markup=_stats_kb(7))
 
 
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     await callback.answer()
     await callback.message.edit_text(await _render_stats(7), reply_markup=_stats_kb(7))
 
 
 @router.callback_query(F.data.startswith("stats:"))
 async def stats_period(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     try:
         days = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
@@ -159,15 +158,12 @@ async def stats_period(callback: CallbackQuery):
     await callback.answer()
     try:
         await callback.message.edit_text(await _render_stats(days), reply_markup=_stats_kb(days))
-    except Exception:
+    except TelegramBadRequest:
         pass  # «message is not modified» при повторном тапе того же периода — игнор
 
 
 @router.callback_query(F.data == "admin:broadcast")
 async def admin_broadcast_hint(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     await callback.answer()
     await callback.message.answer(
         "📢 Чтобы разослать сообщение всем юзерам, пришли:\n"
@@ -177,8 +173,6 @@ async def admin_broadcast_hint(callback: CallbackQuery):
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
-    if not is_admin(message.from_user.username):
-        return
     body = message.text.partition(" ")[2].strip()
     if not body:
         await message.answer("Формат: <code>/broadcast текст сообщения</code>")
@@ -195,9 +189,6 @@ async def cmd_broadcast(message: Message):
 
 @router.callback_query(F.data == "broadcast:confirm")
 async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     redis = get_redis()
     key = _broadcast_key(callback.from_user.id)
     body = await redis.get(key)
@@ -211,9 +202,7 @@ async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
         rows = (await session.execute(text("SELECT telegram_id FROM users"))).all()
     ids = [row[0] for row in rows]
     # В фоне: рассылка может идти десятки секунд и не должна держать ответ вебхука.
-    task = asyncio.create_task(_run_broadcast(bot, ids, body, callback.message))
-    _broadcast_tasks.add(task)
-    task.add_done_callback(_broadcast_tasks.discard)
+    spawn(_run_broadcast(bot, ids, body, callback.message))
 
 
 async def _run_broadcast(bot: Bot, ids: list[int], body: str, status_message: Message) -> None:
@@ -223,9 +212,6 @@ async def _run_broadcast(bot: Bot, ids: list[int], body: str, status_message: Me
 
 @router.callback_query(F.data == "broadcast:cancel")
 async def broadcast_cancel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
-        await callback.answer()
-        return
     await get_redis().delete(_broadcast_key(callback.from_user.id))
     await callback.answer()
     await callback.message.edit_text("❌ Рассылка отменена.")

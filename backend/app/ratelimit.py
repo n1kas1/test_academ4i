@@ -151,6 +151,7 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
                 allowed=True,
                 credits=user.credits,
                 free_remaining=user.free_remaining(now, limit, window),
+                free_resets_at=user.free_resets_at(window),
             )
 
         # Free tier (скользящее окно)
