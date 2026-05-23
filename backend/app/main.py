@@ -8,6 +8,7 @@ Webhook от Telegram приходит на POST /webhook,
 """
 import asyncio
 import logging
+import socket
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher
@@ -46,13 +47,23 @@ async def lifespan(app: FastAPI):
 
     # Зарегистрировать webhook в TG. НЕ блокируем старт если упало —
     # обычно webhook уже установлен у Telegram, переустановка не критична.
+    # Передаём ip_address (резолвим домен локально): резолвер Telegram временами
+    # не находит duckdns-домен ("Temporary failure in name resolution") и
+    # setWebhook падает на деплое → бот переставал получать апдейты. Явный IP
+    # это обходит (SNI остаётся доменным, сертификат Caddy подходит).
     try:
+        try:
+            webhook_ip = socket.gethostbyname(settings.webhook_domain)
+        except OSError as e:
+            webhook_ip = None
+            logger.warning(f"webhook domain resolve failed locally: {e}")
         await bot.set_webhook(
             url=settings.webhook_url,
             secret_token=settings.telegram_webhook_secret,
+            ip_address=webhook_ip,
             drop_pending_updates=True,
         )
-        logger.info(f"Webhook set: {settings.webhook_url}")
+        logger.info(f"Webhook set: {settings.webhook_url} (ip={webhook_ip})")
     except Exception as e:
         logger.warning(
             f"set_webhook failed (non-fatal — likely DNS lag): {e}. "
