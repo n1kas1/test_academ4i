@@ -99,7 +99,9 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
             res = subprocess.run(
                 ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
                  "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
-                capture_output=True, text=True, timeout=30,
+                # errors="replace": лог pdflatex может содержать не-UTF-8 байты
+                # (cp1251/T2A в предупреждениях) — строгий декод иначе роняет рендер.
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30,
             )
         except subprocess.TimeoutExpired:
             logger.error("pdflatex timeout")
