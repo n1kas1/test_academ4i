@@ -35,8 +35,10 @@ MSG_HELP = (
     "укажи номер и подзадачу, например: <i>«реши 2851 а)»</i>.\n\n"
     f"💎 <b>Тарифы:</b>\n"
     f"• Free — <b>{settings.free_tasks_per_week} задачи в неделю</b> (бесплатно)\n"
-    f"• Пакет — <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> (без срока)\n"
-    f"• Premium — <b>30 дней безлимит за {settings.premium_price_stars}⭐</b>\n\n"
+    f"• Пакеты — <b>{settings.pack_tasks} за {settings.pack_price_stars}⭐</b> или "
+    f"<b>{settings.pack_large_tasks} за {settings.pack_large_price_stars}⭐</b> (без срока)\n"
+    f"• Premium — <b>неделя {settings.premium_week_price_stars}⭐</b> или "
+    f"<b>месяц {settings.premium_price_stars}⭐</b> (безлимит, до {settings.premium_daily_cap}/день)\n\n"
     "Поддержка: @Academ4I_support"
 )
 
@@ -71,9 +73,10 @@ def msg_quota_exceeded(resets_at: Optional[datetime] = None) -> str:
         f"⛔ Бесплатные <b>{settings.free_tasks_per_week} задачи на неделю</b> исчерпаны.\n\n"
         f"{when}"
         "Не хочешь ждать — выбери в меню 👇:\n"
-        f"• 🎁 <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> "
+        f"• 🎁 <b>Пакет {settings.pack_tasks} задач — {settings.pack_price_stars}⭐</b> "
         "(разово, без срока)\n"
-        f"• 💎 <b>Premium {settings.premium_price_stars}⭐</b> — безлимит на 30 дней"
+        f"• 💎 <b>Premium — неделя {settings.premium_week_price_stars}⭐ / "
+        f"месяц {settings.premium_price_stars}⭐</b> (безлимит)"
     )
 
 MSG_ERROR = (
@@ -136,17 +139,22 @@ MSG_PREMIUM_EXPIRED = (
 
 
 MSG_BUY_PACK_PROMPT = (
-    f"🎁 <b>Пакет {settings.pack_tasks} задач</b>\n\n"
-    f"✓ {settings.pack_tasks} решений сверх бесплатных\n"
-    f"✓ Без срока — используй когда угодно\n"
-    f"✓ Цена: <b>{settings.pack_price_stars}⭐</b>\n\n"
-    f"Жми кнопку оплаты ниже 👇"
+    "🎁 <b>Пакеты задач</b> (без срока, расходуются по мере решений):\n\n"
+    f"• {settings.pack_tasks} задач — <b>{settings.pack_price_stars}⭐</b>\n"
+    f"• {settings.pack_large_tasks} задач — <b>{settings.pack_large_price_stars}⭐</b> (выгоднее)\n\n"
+    "Выбери пакет ниже 👇"
 )
 
 MSG_BUY_PREMIUM_PROMPT = (
-    f"💎 <b>Premium на 30 дней</b>\n\n"
-    f"✓ Безлимит решений\n"
-    f"✓ Все темы: матан, линал, алгебра, группы\n"
-    f"✓ Цена: <b>{settings.premium_price_stars}⭐</b>\n\n"
-    f"Жми кнопку оплаты ниже 👇"
+    "💎 <b>Premium</b> — безлимит решений "
+    f"(до {settings.premium_daily_cap} задач/день), все предметы:\n\n"
+    f"• Неделя — <b>{settings.premium_week_price_stars}⭐</b> (на сессию)\n"
+    f"• Месяц — <b>{settings.premium_price_stars}⭐</b>\n\n"
+    "Выбери период ниже 👇"
+)
+
+
+MSG_PREMIUM_CAP = (
+    f"⏳ Дневной лимит Premium ({settings.premium_daily_cap} задач) на сегодня исчерпан.\n\n"
+    "Обновится завтра в 00:00 UTC. Это защита от перегрузки — обычно его не достичь 🙂"
 )

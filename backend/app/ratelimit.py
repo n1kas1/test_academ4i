@@ -114,6 +114,11 @@ async def get_or_create_user(
         return user
 
 
+def _premium_cap_key(telegram_id: int, now: datetime) -> str:
+    """Ключ дневного fair-use счётчика Premium (UTC-сутки)."""
+    return f"premcap:{telegram_id}:{now:%Y%m%d}"
+
+
 async def check_quota(telegram_id: int, username: Optional[str] = None) -> QuotaResult:
     """Проверить может ли юзер сделать запрос."""
     now = datetime.now(timezone.utc)
@@ -136,8 +141,16 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
         limit = settings.free_tasks_per_week
         window = settings.free_window_days
 
-        # Premium активен?
+        # Premium активен? Безлимит, но в рамках дневного fair-use лимита.
         if user.has_premium(now):
+            used_today = int(await get_redis().get(_premium_cap_key(telegram_id, now)) or 0)
+            if used_today >= settings.premium_daily_cap:
+                return QuotaResult(
+                    allowed=False,
+                    reason="premium_daily_cap",
+                    is_premium=True,
+                    premium_until=user.premium_until,
+                )
             return QuotaResult(
                 allowed=True,
                 is_premium=True,
@@ -213,10 +226,19 @@ async def consume_quota(telegram_id: int, username: Optional[str] = None) -> Non
                      OR free_window_start <= NOW() - make_interval(days => :wd) THEN 1
                 ELSE free_used + 1 END
         WHERE telegram_id = :tg
+        RETURNING premium_until
     """)
     async with get_session() as session:
-        await session.execute(sql, {"tg": telegram_id, "wd": settings.free_window_days})
+        row = (await session.execute(sql, {"tg": telegram_id, "wd": settings.free_window_days})).first()
         await session.commit()
+
+    # Premium-консьюм (квота в БД не тронута) → инкремент дневного fair-use счётчика.
+    now = datetime.now(timezone.utc)
+    if row and row[0] and row[0] > now:
+        redis = get_redis()
+        key = _premium_cap_key(telegram_id, now)
+        if await redis.incr(key) == 1:
+            await redis.expire(key, 48 * 3600)
 
 
 async def _apply_credits(session, telegram_id: int, amount: int) -> int:

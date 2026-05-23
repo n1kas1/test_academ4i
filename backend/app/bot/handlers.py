@@ -29,6 +29,8 @@ from app.bot.keyboards import (
     BTN_BUY_PREMIUM,
     BTN_HELP,
     main_menu_keyboard,
+    pack_choice_keyboard,
+    premium_choice_keyboard,
     solution_keyboard,
     task_choice_keyboard,
 )
@@ -37,6 +39,7 @@ from app.bot.messages import (
     MSG_BUY_PACK_PROMPT,
     MSG_BUY_PREMIUM_PROMPT,
     MSG_DEMO_CAPTION,
+    MSG_PREMIUM_CAP,
     MSG_ERROR,
     MSG_HELP,
     MSG_PROCESSING,
@@ -48,7 +51,6 @@ from app.bot.messages import (
 )
 from app.config import settings
 from app.core.redis import get_redis
-from app.payments.tg_stars import send_pack_invoice, send_premium_invoice
 from app.analytics import log_event
 from app.ratelimit import (
     check_quota,
@@ -158,8 +160,7 @@ async def menu_buy_pack(message: Message, bot: Bot):
             reply_markup=kb,
         )
         return
-    await message.answer(MSG_BUY_PACK_PROMPT)
-    await send_pack_invoice(bot, chat_id=message.chat.id)
+    await message.answer(MSG_BUY_PACK_PROMPT, reply_markup=pack_choice_keyboard())
 
 
 @router.message(F.text == BTN_BUY_PREMIUM)
@@ -182,8 +183,7 @@ async def _start_premium_purchase(message: Message, bot: Bot):
             reply_markup=kb,
         )
         return
-    await message.answer(MSG_BUY_PREMIUM_PROMPT)
-    await send_premium_invoice(bot, chat_id=message.chat.id)
+    await message.answer(MSG_BUY_PREMIUM_PROMPT, reply_markup=premium_choice_keyboard())
 
 
 async def _send_balance(message: Message):
@@ -313,6 +313,9 @@ async def _solve_incoming(
 
     quota = await check_quota(user_id, username=username)
     if not quota.allowed:
+        if quota.reason == "premium_daily_cap":
+            await message.answer(MSG_PREMIUM_CAP)
+            return
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
         log_event(user_id, "paywall_shown")
         await message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
@@ -440,6 +443,9 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     quota = await check_quota(user_id, username=username)
     if not quota.allowed:
         await callback.answer()
+        if quota.reason == "premium_daily_cap":
+            await callback.message.answer(MSG_PREMIUM_CAP)
+            return
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
         log_event(user_id, "paywall_shown")
         await callback.message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
@@ -583,8 +589,7 @@ async def handle_renew_premium(callback: CallbackQuery, bot: Bot):
         await callback.answer("👑 У тебя безлимит как у админа.", show_alert=True)
         return
     await callback.answer()
-    await callback.message.answer(MSG_BUY_PREMIUM_PROMPT)
-    await send_premium_invoice(bot, chat_id=callback.message.chat.id)
+    await callback.message.answer(MSG_BUY_PREMIUM_PROMPT, reply_markup=premium_choice_keyboard())
 
 
 @router.message(F.text)

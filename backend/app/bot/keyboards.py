@@ -9,10 +9,38 @@ from aiogram.types import (
 from app.config import settings
 
 # === Тексты кнопок главного меню ===
-BTN_BUY_PACK = f"🎁 {settings.pack_tasks} задач — {settings.pack_price_stars}⭐"
-BTN_BUY_PREMIUM = f"💎 Premium 30 дней — {settings.premium_price_stars}⭐"
+BTN_BUY_PACK = "🎁 Пакеты задач"
+BTN_BUY_PREMIUM = "💎 Premium"
 BTN_BALANCE = "📊 Мой баланс"
 BTN_HELP = "ℹ️ Помощь"
+
+
+def pack_choice_keyboard() -> InlineKeyboardMarkup:
+    """Inline-выбор пакета задач (без срока)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🎁 {settings.pack_tasks} задач — {settings.pack_price_stars}⭐",
+            callback_data="buy:pack5",
+        )],
+        [InlineKeyboardButton(
+            text=f"🎁 {settings.pack_large_tasks} задач — {settings.pack_large_price_stars}⭐",
+            callback_data="buy:pack10",
+        )],
+    ])
+
+
+def premium_choice_keyboard() -> InlineKeyboardMarkup:
+    """Inline-выбор периода Premium."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💎 Неделя — {settings.premium_week_price_stars}⭐",
+            callback_data="buy:premweek",
+        )],
+        [InlineKeyboardButton(
+            text=f"💎 Месяц — {settings.premium_price_stars}⭐",
+            callback_data="buy:premmonth",
+        )],
+    ])
 
 
 def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> ReplyKeyboardMarkup:

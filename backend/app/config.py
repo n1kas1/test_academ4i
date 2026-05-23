@@ -46,13 +46,19 @@ class Settings(BaseSettings):
     free_tasks_per_week: int = 2
     free_window_days: int = 7
 
-    # Premium-подписка на 30 дней безлимит
-    premium_price_stars: int = 149
+    # Premium-подписка: безлимит на срок. Fair-use лимит в день — защита от
+    # перерасхода (себестоимость ~7₽/задача): студенту 10/день фактически безлимит.
+    premium_price_stars: int = 199
     premium_duration_days: int = 30
+    premium_week_price_stars: int = 99
+    premium_week_days: int = 7
+    premium_daily_cap: int = 10        # макс. задач в сутки на Premium (UTC-сутки)
 
-    # Пакет — разовая покупка N задач (без срока)
+    # Пакеты — разовая покупка N задач (без срока, расходуются как credits).
     pack_price_stars: int = 79
     pack_tasks: int = 5
+    pack_large_price_stars: int = 139
+    pack_large_tasks: int = 10
 
     # === Админы (безлимит) — usernames через запятую без @ ===
     admin_usernames: str = "manag31"
