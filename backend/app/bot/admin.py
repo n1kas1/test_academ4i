@@ -36,8 +36,9 @@ def _broadcast_key(admin_id: int) -> str:
     return f"broadcast:draft:{admin_id}"
 
 
-def _pct(part: int, whole: int) -> str:
-    return f"{round(100 * part / whole)}%" if whole else "—"
+def _pct_suffix(part: int, whole: int) -> str:
+    """' (NN%)' от предыдущего шага воронки; пусто, если делить не на что."""
+    return f" ({round(100 * part / whole)}%)" if whole else ""
 
 
 # === Клавиатуры ===
@@ -101,9 +102,9 @@ async def _render_stats(days: int) -> str:
         f"Решено задач: <b>{r['solved_p']}</b>\n\n"
         "🛒 <b>Воронка</b> <i>(за всё время)</i>\n"
         f"🟢 Старт — <b>{r['f_start']}</b>\n"
-        f"✏️ Решили ≥1 — <b>{r['f_solve']}</b> ({_pct(r['f_solve'], r['f_start'])})\n"
-        f"⛔ Дошли до paywall — <b>{r['f_paywall']}</b> ({_pct(r['f_paywall'], r['f_solve'])})\n"
-        f"💎 Купили — <b>{r['f_purchase']}</b> ({_pct(r['f_purchase'], r['f_paywall'])})\n\n"
+        f"✏️ Решили ≥1 — <b>{r['f_solve']}</b>{_pct_suffix(r['f_solve'], r['f_start'])}\n"
+        f"⛔ Дошли до paywall — <b>{r['f_paywall']}</b>{_pct_suffix(r['f_paywall'], r['f_solve'])}\n"
+        f"💎 Купили — <b>{r['f_purchase']}</b>{_pct_suffix(r['f_purchase'], r['f_paywall'])}\n\n"
         "💰 <b>Деньги</b>\n"
         f"Выручка за период: <b>{r['revenue_p']}⭐</b>\n"
         f"Покупки (всё время):\n{prod_lines}"
