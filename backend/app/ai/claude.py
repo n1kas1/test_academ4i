@@ -26,6 +26,21 @@ def get_client() -> AsyncAnthropic:
     return _client
 
 
+# Приблизительная стоимость токенов в ₽ за 1M (вход / выход). Грубый ориентир
+# для логов — КАЛИБРУЙ под реальные списания ProxyAPI (markup + курс).
+# Картинки vision считаются как входные токены; thinking — как выходные.
+_RUB_PER_MTOK = {
+    "haiku":  (90, 450),     # ~$1/$5 при ~90₽/$
+    "sonnet": (270, 1350),   # ~$3/$15
+}
+
+
+def estimate_cost_rub(model: str, in_tok: int, out_tok: int) -> float:
+    """Грубая оценка стоимости вызова в ₽ (для логов)."""
+    pin, pout = _RUB_PER_MTOK["haiku" if "haiku" in model.lower() else "sonnet"]
+    return (in_tok * pin + out_tok * pout) / 1_000_000
+
+
 # ───────────────────────────────────────────────────────────────────────
 # 1) Извлечение условия задачи в текст (для RAG retrieval)
 # ───────────────────────────────────────────────────────────────────────
@@ -123,8 +138,10 @@ async def extract_condition_text(
                 raw += block.text
         condition, task_ids = _parse_ocr_json(raw)
         logger.info(
-            f"OCR extract: in={response.usage.input_tokens}, "
-            f"out={response.usage.output_tokens}, len={len(condition)}, task_ids={task_ids}"
+            f"OCR extract [{settings.ocr_model}]: in={response.usage.input_tokens}, "
+            f"out={response.usage.output_tokens}, "
+            f"≈{estimate_cost_rub(settings.ocr_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽, "
+            f"len={len(condition)}, task_ids={task_ids}"
         )
         return condition, task_ids
     except Exception as e:
@@ -282,8 +299,9 @@ async def solve_with_claude_vision(
             solution_text += block.text
 
     logger.info(
-        f"Claude solved (thinking={thinking_on}): in={response.usage.input_tokens}, "
-        f"out={response.usage.output_tokens}"
+        f"Claude solved [{settings.claude_model}, thinking={thinking_on}]: "
+        f"in={response.usage.input_tokens}, out={response.usage.output_tokens}, "
+        f"≈{estimate_cost_rub(settings.claude_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽"
     )
 
     return solution_text.strip()

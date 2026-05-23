@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     claude_model: str = "claude-sonnet-4-6"
     claude_use_extended_thinking: bool = True
     # Модель лёгкого OCR-прохода (распознать условие + номера задач).
-    # По умолчанию = основная; можно удешевить на claude-haiku-4-5-20251001 через .env.
-    ocr_model: str = "claude-sonnet-4-6"
+    # Haiku: распознавание — простая работа, в разы дешевле Sonnet; решение остаётся на claude_model.
+    ocr_model: str = "claude-haiku-4-5-20251001"
 
     # === OpenAI — через ProxyAPI (для эмбеддингов и парсинга PDF) ===
     openai_api_key: str
