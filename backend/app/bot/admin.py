@@ -1,4 +1,6 @@
 """Админ-команды: /stats (метрики) и /broadcast (рассылка всем). Под is_admin."""
+import asyncio
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
@@ -17,6 +19,9 @@ from app.ratelimit import is_admin
 router = Router()
 
 _BROADCAST_TTL_SEC = 600  # черновик рассылки живёт 10 минут
+
+# Держим ссылки на фоновые задачи рассылки, чтобы их не собрал GC до завершения.
+_broadcast_tasks: set[asyncio.Task] = set()
 
 
 def _broadcast_key(admin_id: int) -> str:
@@ -114,8 +119,15 @@ async def broadcast_confirm(callback: CallbackQuery, bot: Bot):
     async with get_session() as session:
         rows = (await session.execute(text("SELECT telegram_id FROM users"))).all()
     ids = [row[0] for row in rows]
+    # В фоне: рассылка может идти десятки секунд и не должна держать ответ вебхука.
+    task = asyncio.create_task(_run_broadcast(bot, ids, body, callback.message))
+    _broadcast_tasks.add(task)
+    task.add_done_callback(_broadcast_tasks.discard)
+
+
+async def _run_broadcast(bot: Bot, ids: list[int], body: str, status_message: Message) -> None:
     sent, failed = await broadcast_send(bot, ids, body)
-    await callback.message.answer(f"✅ Готово: отправлено <b>{sent}</b>, не дошло <b>{failed}</b>.")
+    await status_message.answer(f"✅ Готово: отправлено <b>{sent}</b>, не дошло <b>{failed}</b>.")
 
 
 @router.callback_query(F.data == "broadcast:cancel")

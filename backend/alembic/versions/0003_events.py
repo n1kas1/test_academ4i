@@ -19,7 +19,12 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.create_table(
         "events",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("telegram_id", sa.BigInteger(), nullable=False),
         sa.Column("type", sa.String(length=32), nullable=False),
         sa.Column("props", postgresql.JSONB(), nullable=True),
