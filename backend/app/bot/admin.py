@@ -1,4 +1,9 @@
-"""Админ-команды: /stats (метрики) и /broadcast (рассылка всем). Под is_admin."""
+"""Админ-команды и панель: /admin (меню), /stats (метрики), /broadcast (рассылка).
+
+Всё под is_admin. /stats и админ-меню работают на инлайн-кнопках:
+- меню: 📊 Статистика / 📢 Рассылка
+- статистика: переключатель периода (сегодня / 7 / 30 дней), пересчёт по кнопке
+"""
 import asyncio
 
 from aiogram import Bot, F, Router
@@ -23,6 +28,9 @@ _BROADCAST_TTL_SEC = 600  # черновик рассылки живёт 10 ми
 # Держим ссылки на фоновые задачи рассылки, чтобы их не собрал GC до завершения.
 _broadcast_tasks: set[asyncio.Task] = set()
 
+# Периоды переключателя статистики: дни → подпись.
+_PERIODS = ((1, "сегодня"), (7, "7 дней"), (30, "30 дней"))
+
 
 def _broadcast_key(admin_id: int) -> str:
     return f"broadcast:draft:{admin_id}"
@@ -32,22 +40,43 @@ def _pct(part: int, whole: int) -> str:
     return f"{round(100 * part / whole)}%" if whole else "—"
 
 
+# === Клавиатуры ===
+
+def _menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+        InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"),
+    ]])
+
+
+def _stats_kb(active_days: int) -> InlineKeyboardMarkup:
+    period_row = [
+        InlineKeyboardButton(
+            text=(f"• {label} •" if days == active_days else label),
+            callback_data=f"stats:{days}",
+        )
+        for days, label in _PERIODS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        period_row,
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="admin:menu")],
+    ])
+
+
+# === Статистика ===
+
 _STATS_SQL = text("""
 SELECT
   (SELECT COUNT(*) FROM users) AS total_users,
-  (SELECT COUNT(*) FROM users WHERE created_at > now() - interval '1 day') AS new_1d,
-  (SELECT COUNT(*) FROM users WHERE created_at > now() - interval '7 days') AS new_7d,
-  (SELECT COUNT(*) FROM users WHERE created_at > now() - interval '30 days') AS new_30d,
-  (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at > now() - interval '1 day') AS dau,
-  (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at > now() - interval '7 days') AS wau,
-  (SELECT COUNT(*) FROM events WHERE type='solve' AND created_at > now() - interval '7 days') AS solved_7d,
-  (SELECT COUNT(*) FROM events WHERE type='solve' AND created_at > now() - interval '30 days') AS solved_30d,
+  (SELECT COUNT(*) FROM users WHERE created_at > now() - make_interval(days => :days)) AS new_p,
+  (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at > now() - make_interval(days => :days)) AS active_p,
+  (SELECT COUNT(*) FROM events WHERE type='solve' AND created_at > now() - make_interval(days => :days)) AS solved_p,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='start') AS f_start,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='solve') AS f_solve,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='paywall_shown') AS f_paywall,
   (SELECT COUNT(DISTINCT telegram_id) FROM payments WHERE status='succeeded') AS f_purchase,
   (SELECT COALESCE(SUM(amount_stars), 0) FROM payments WHERE status='succeeded'
-     AND created_at > now() - interval '30 days') AS revenue_30d
+     AND created_at > now() - make_interval(days => :days)) AS revenue_p
 """)
 
 _PRODUCTS_SQL = text(
@@ -55,33 +84,94 @@ _PRODUCTS_SQL = text(
 )
 
 
+async def _render_stats(days: int) -> str:
+    label = next((lbl for d, lbl in _PERIODS if d == days), f"{days} дн")
+    async with get_session() as session:
+        r = (await session.execute(_STATS_SQL, {"days": days})).one()._mapping
+        products = (await session.execute(_PRODUCTS_SQL)).all()
+
+    prod_lines = "\n".join(f"   • {p}: {n}" for p, n in products) or "   • —"
+
+    return (
+        f"📊 <b>Статистика</b> · <i>{label}</i>\n"
+        "━━━━━━━━━━━━━━\n"
+        "👥 <b>Аудитория</b>\n"
+        f"Всего юзеров: <b>{r['total_users']}</b>\n"
+        f"Новых: <b>{r['new_p']}</b> · активных: <b>{r['active_p']}</b>\n"
+        f"Решено задач: <b>{r['solved_p']}</b>\n\n"
+        "🛒 <b>Воронка</b> <i>(за всё время)</i>\n"
+        f"🟢 Старт — <b>{r['f_start']}</b>\n"
+        f"✏️ Решили ≥1 — <b>{r['f_solve']}</b> ({_pct(r['f_solve'], r['f_start'])})\n"
+        f"⛔ Дошли до paywall — <b>{r['f_paywall']}</b> ({_pct(r['f_paywall'], r['f_solve'])})\n"
+        f"💎 Купили — <b>{r['f_purchase']}</b> ({_pct(r['f_purchase'], r['f_paywall'])})\n\n"
+        "💰 <b>Деньги</b>\n"
+        f"Выручка за период: <b>{r['revenue_p']}⭐</b>\n"
+        f"Покупки (всё время):\n{prod_lines}"
+    )
+
+
+# === Команды и колбэки ===
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.username):
+        return
+    await message.answer("🛠 <b>Админ-панель</b>\nВыбери раздел 👇", reply_markup=_menu_kb())
+
+
+@router.callback_query(F.data == "admin:menu")
+async def admin_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.username):
+        await callback.answer()
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "🛠 <b>Админ-панель</b>\nВыбери раздел 👇", reply_markup=_menu_kb()
+    )
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     if not is_admin(message.from_user.username):
         return
-    async with get_session() as session:
-        r = (await session.execute(_STATS_SQL)).one()._mapping
-        products = (await session.execute(_PRODUCTS_SQL)).all()
+    await message.answer(await _render_stats(7), reply_markup=_stats_kb(7))
 
-    prod_lines = "\n".join(f"  • {p}: {n}" for p, n in products) or "  • —"
 
-    report = (
-        "📊 <b>Статистика</b>\n\n"
-        "<b>Аудитория</b>\n"
-        f"Всего юзеров: <b>{r['total_users']}</b>\n"
-        f"Новые: {r['new_1d']} / сут · {r['new_7d']} / нед · {r['new_30d']} / мес\n"
-        f"DAU: <b>{r['dau']}</b> · WAU: <b>{r['wau']}</b>\n"
-        f"Решено задач: {r['solved_7d']} / нед · {r['solved_30d']} / мес\n\n"
-        "<b>Воронка</b> (за всё время)\n"
-        f"1. Старт: <b>{r['f_start']}</b>\n"
-        f"2. Решили ≥1: <b>{r['f_solve']}</b> ({_pct(r['f_solve'], r['f_start'])})\n"
-        f"3. Упёрлись в paywall: <b>{r['f_paywall']}</b> ({_pct(r['f_paywall'], r['f_solve'])})\n"
-        f"4. Купили: <b>{r['f_purchase']}</b> ({_pct(r['f_purchase'], r['f_paywall'])})\n\n"
-        "<b>Деньги</b>\n"
-        f"Выручка за 30 дн: <b>{r['revenue_30d']}⭐</b>\n"
-        f"Покупки по продуктам:\n{prod_lines}"
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.username):
+        await callback.answer()
+        return
+    await callback.answer()
+    await callback.message.edit_text(await _render_stats(7), reply_markup=_stats_kb(7))
+
+
+@router.callback_query(F.data.startswith("stats:"))
+async def stats_period(callback: CallbackQuery):
+    if not is_admin(callback.from_user.username):
+        await callback.answer()
+        return
+    try:
+        days = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        days = 7
+    await callback.answer()
+    try:
+        await callback.message.edit_text(await _render_stats(days), reply_markup=_stats_kb(days))
+    except Exception:
+        pass  # «message is not modified» при повторном тапе того же периода — игнор
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_hint(callback: CallbackQuery):
+    if not is_admin(callback.from_user.username):
+        await callback.answer()
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "📢 Чтобы разослать сообщение всем юзерам, пришли:\n"
+        "<code>/broadcast текст сообщения</code>"
     )
-    await message.answer(report)
 
 
 @router.message(Command("broadcast"))
