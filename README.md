@@ -1,85 +1,89 @@
 # Academ4I
 
-Telegram бот: AI-решатель задач по матану, линейной алгебре, алгебре (теория групп) и др. для студентов технических вузов РФ.
+Телеграм-бот, который решает задачи по матану, линалу и алгебре (вплоть до теории групп) для студентов техвузов. Кидаешь фото задачи — получаешь пошаговое решение: картинкой (отрендеренный LaTeX) и сырым LaTeX, чтобы можно было скопировать к себе.
 
-**Бот:** [@Academ4I_bot](https://t.me/Academ4I_bot)
+Бот живёт тут: [@Academ4I_bot](https://t.me/Academ4I_bot)
 
-## Стек
+## Из чего собрано
 
-- **Backend:** FastAPI (async) + aiogram 3
-- **БД:** Supabase Postgres + pgvector (RAG по учебникам)
-- **Кэш:** Redis
-- **AI vision (OCR формул):** Mathpix
-- **AI reasoning:** Claude 3.7 Sonnet (extended thinking) через ProxyAPI.ru
-- **Эмбеддинги:** OpenAI text-embedding-3-small
-- **Платежи:** Telegram Stars Subscriptions (299₽/мес безлимит)
-- **Хостинг:** Kamatera VPS + Docker + Caddy (HTTPS)
+- FastAPI (асинхронный) + aiogram 3 — вебхук, без long polling
+- Postgres на Supabase с pgvector — заодно и кэш решений, и RAG-база по учебникам
+- Redis — rate limit и всякие короткоживущие ключи
+- Claude Sonnet 4.6 — и распознаёт условие с фото, и решает (extended thinking на доказательствах). Ходим через ProxyAPI.ru
+- OpenAI `text-embedding-3-small` — эмбеддинги для поиска похожих задач (тоже через ProxyAPI)
+- Telegram Stars — оплата (подписка и разовый пакет)
+- Kamatera VPS, всё в Docker. HTTPS отдаёт внешний Caddy от соседнего проекта, в этом compose его нет
 
-## Архитектура AI-pipeline
+Никакого отдельного OCR-сервиса (Mathpix и т.п.) — условие читает сам Claude по картинке.
+
+## Как работает решение
+
+Грубо весь путь от фото до ответа:
 
 ```
-[Фото в TG] → aiogram handler
-            ↓
-        rate limit (Redis)
-            ↓
-        квота юзера (Free/Premium)
-            ↓
-        Mathpix OCR → LaTeX
-            ↓
-        классификация темы (matan/lin_alg/groups/...)
-            ↓
-        эмбеддинг → поиск в pgvector (топ-5 похожих задач+теории)
-            ↓
-        cosine_sim > 0.93 → готовое решение из кэша (1 сек, $0)
-            ↓ (иначе)
-        Claude 3.7 + RAG-контекст → пошаговое решение
-            ↓
-        сохранение в кэш (для будущих юзеров)
-            ↓
-        отправка юзеру (markdown + LaTeX)
+фото в TG
+  → aiogram handler
+  → rate limit (Redis)
+  → проверка квоты (free / credits / premium)
+  → Claude vision читает условие → текст задачи
+  → классификация темы (matan / lin_alg / groups / ...)
+  → эмбеддинг → ищем похожее в pgvector
+  → если нашлось готовое решение с cosine > 0.87 — отдаём из кэша (бесплатно, мгновенно)
+  → иначе: Claude + топ-3 похожих как RAG-контекст → решение, и кладём в кэш
+  → рендерим LaTeX → PDF → PNG
+  → шлём юзеру картинку + сырой LaTeX
 ```
+
+Из кэша отдаём только то, что бот сам когда-то нагенерил (`source = generated`). Куски учебников в базе нужны как RAG-контекст, готовым ответом они не уходят.
 
 ## Тарифы
 
-- **Free:** 7-дневный триал безлимит, потом 0 задач (до подписки)
-- **Premium:** 299₽/мес безлимит через TG Stars Subscriptions
+- Бесплатно — 2 задачи в скользящее окно 7 дней. Без накопления: окно стартует с первой задачи и просто сбрасывается через неделю (так проще бороться с фармом)
+- Premium — 149⭐ за 30 дней, безлимит
+- Разовый пакет — 79⭐ за 5 задач, без срока годности
 
-## База учебников (RAG)
+Админы решают без ограничений.
 
-- Демидович — главный задачник матан
-- Виноградова-Олехник-Садовничий т.1-3 — задачник матан МГУ
-- Антидемидович т.1-6 — полные решения к Демидовичу (few-shot примеры)
-- Кострикин-2009 — главный задачник по алгебре (включая теорию групп)
-- алгебра.pdf — учебник теории
+## RAG-база (учебники)
 
-## Quick Start
+Что распарсено в базу:
+
+- Демидович — основной задачник по матану
+- Виноградова–Олехник–Садовничий, т. 1–3 — задачник матана МГУ
+- Антидемидович, т. 1–6 — полные решения к Демидовичу, идут как few-shot примеры
+- Кострикин (2009) — основной задачник по алгебре, включая теорию групп
+- учебник по теории алгебры
+
+Парсятся скриптом `scripts/parse_textbook.py` (PDF → чанки → эмбеддинги → pgvector).
+
+## Запуск
 
 ```bash
-cp .env.example .env  # заполнить ключи
-docker-compose up --build
+cp .env.example .env   # вписать ключи и токены
+docker compose up -d --build
 ```
 
-После запуска: webhook на `https://<домен>/webhook`, нужно зарегистрировать в @BotFather.
+Локально без Docker не поднять — в зависимостях TeX Live и poppler для рендера. После старта вебхук регистрируется автоматически (адрес берётся из `webhook_domain`).
 
-## Структура
+Подробности про деплой и подводные камни с миграциями на Supabase — в [DEPLOY.md](DEPLOY.md).
+
+## Где что лежит
 
 ```
-academ4i/
-├── backend/                 # FastAPI + aiogram
-│   ├── app/
-│   │   ├── main.py          # entry point
-│   │   ├── config.py        # настройки
-│   │   ├── core/            # db, redis
-│   │   ├── models/          # ORM-модели
-│   │   ├── bot/             # handlers, keyboards, messages
-│   │   ├── ai/              # mathpix, claude, embeddings, retrieval
-│   │   └── payments/        # TG Stars subscriptions
-│   ├── alembic/             # миграции
-│   └── requirements.txt
-├── scripts/
-│   └── parse_textbook.py    # парсинг PDF → чанки → pgvector
-├── textbooks/               # PDF учебников (gitignore-ed)
-├── docker-compose.yml
-├── Caddyfile
-└── .env.example
+backend/app/
+  main.py        — вход, FastAPI + вебхук, lifespan
+  config.py      — настройки из .env
+  ai/            — vision, claude, embeddings, retrieval, pipeline (сердце)
+  bot/           — handlers, keyboards, messages, admin
+  payments/      — Telegram Stars
+  core/          — db, redis
+  render/        — LaTeX → PNG
+  models/        — ORM-модели
+  ratelimit.py   — квоты и rate limit
+  analytics.py   — лог событий для статистики
+scripts/parse_textbook.py
+backend/alembic/ — миграции
+docker-compose.yml
 ```
+
+Тестов в репо нет — проверяю прогоном через живой бот.

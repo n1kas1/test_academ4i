@@ -36,7 +36,7 @@ curl http://localhost:8001/health
 
 ## Архитектура
 
-**Точка входа** — [backend/app/main.py](backend/app/main.py): FastAPI с aiogram-вебхуком на `POST /webhook` (секрет через заголовок `X-Telegram-Bot-Api-Secret-Token`). Вебхук регистрируется в Telegram при старте через lifespan. Порядок роутеров критичен: `tg_stars.router` идёт **до** `handlers.router`, чтобы `pre_checkout_query`/`successful_payment` ловились раньше обработчика фото.
+**Точка входа** — [backend/app/main.py](backend/app/main.py): FastAPI с aiogram-вебхуком на `POST /webhook` (секрет через заголовок `X-Telegram-Bot-Api-Secret-Token`). При старте lifespan инициализирует БД и Redis, регистрирует вебхук в Telegram и запускает фоновую задачу `premium_notifier_loop` (см. ниже), отменяя её при shutdown. Порядок роутеров критичен: `tg_stars.router` и `admin.router` идут **до** `handlers.router` — чтобы `pre_checkout_query`/`successful_payment` и админ-команды ловились раньше «всеядного» обработчика фото/текста.
 
 **AI-pipeline** — [backend/app/ai/pipeline.py](backend/app/ai/pipeline.py), сердце проекта. `solve_task_from_photo()`:
 1. `prepare_image` (vision.py) — base64 + resize
@@ -54,17 +54,20 @@ curl http://localhost:8001/health
 
 **Слои `app/`:**
 - `ai/` — vision, claude, embeddings, retrieval, pipeline (Claude и OpenAI ходят через **ProxyAPI.ru**, см. base_url в config)
-- `bot/` — handlers, keyboards, messages
+- `bot/` — handlers, keyboards, messages; `admin.py` — админ-команды `/admin` (меню), `/stats` (метрики за период с переключателем), `/broadcast` (рассылка с подтверждением, черновик в Redis)
 - `payments/tg_stars.py` — Telegram Stars (подписка + разовый пакет)
 - `core/` — db (asyncpg/SQLAlchemy async), redis
 - `render/latex_to_png.py` — LaTeX → PDF → PNG через TeX Live (кэш по hash содержимого)
-- `models/` — user, solution, payment; `ratelimit.py` — квоты и rate limit через Redis
+- `models/` — user, solution, payment, event (+ `base.py` — declarative base, `TimestampMixin`); `ratelimit.py` — квоты и rate limit через Redis
+- `notify.py` — общий троттлящий рассыльщик (`send_one`/`broadcast_send`, ~20 msg/s, обработка flood-control 429). Используют и `premium_notify`, и `/broadcast`
+- `analytics.py` — fire-and-forget лог продуктовых событий (`log_event` → таблица `events`, типы: start/solve/paywall_shown). Никогда не бросает в hot-path
+- `premium_notify.py` — фоновый цикл (`premium_notifier_loop`, проверка раз в 3 ч): шлёт напоминания о Premium «скоро закончится» (≤2 дней) и «закончился» (последние 3 дня). Дедупликация — через Redis-ключи с TTL ~40 дней. Запускается из lifespan, не cron/отдельный процесс
 
 **БД:** Supabase Postgres + pgvector. Главная таблица `solutions` (task_text, embedding vector(1536), topic, source, solution_markdown, usage_count) — служит и кэшем сгенерированных решений, и RAG-базой учебников. `source` различает учебник («Демидович (стр. 42)») и `generated`. `search_path` должен включать `public,extensions` (иначе «vector type not found»).
 
 ## Тарифы (в config.py)
 
-3 задачи бесплатно навсегда → потом подписка (149⭐/30 дней безлимит) или пакет (79⭐/5 задач). Админы (`admin_usernames`) — безлимит.
+Free: **2 задачи на скользящее окно 7 дней** (`free_tasks_per_week` / `free_window_days`) — потолок жёсткий, без накопления (антифарм): окно открывается при первой бесплатной задаче и сбрасывается только спустя 7 дней. Дальше — подписка (149⭐/30 дней безлимит) или разовый пакет (79⭐/5 задач, без срока). Списание квоты атомарно одним `UPDATE` с CASE-выражениями (порядок: premium → credits → free), см. `consume_quota` в `ratelimit.py`. Админы (`admin_usernames`) — безлимит.
 
 ## Конфиг
 
