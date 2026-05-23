@@ -40,10 +40,11 @@ from app.bot.messages import (
     MSG_ERROR,
     MSG_HELP,
     MSG_PROCESSING,
-    MSG_QUOTA_EXCEEDED,
     MSG_START,
+    MSG_ADMIN_HELP,
     msg_balance,
     msg_choose_task,
+    msg_quota_exceeded,
 )
 from app.config import settings
 from app.core.redis import get_redis
@@ -112,7 +113,10 @@ async def cmd_menu(message: Message):
 async def cmd_help(message: Message):
     user = message.from_user
     kb, _ = await _menu_kb(user.id, user.username)
-    await message.answer(MSG_HELP, reply_markup=kb)
+    help_text = MSG_HELP
+    if is_admin(user.username):
+        help_text = f"{MSG_HELP}\n\n{MSG_ADMIN_HELP}"
+    await message.answer(help_text, reply_markup=kb)
 
 
 @router.message(Command("balance"))
@@ -311,7 +315,7 @@ async def _solve_incoming(
     if not quota.allowed:
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
         log_event(user_id, "paywall_shown")
-        await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
+        await message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
         return
 
     try:
@@ -438,7 +442,7 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
         await callback.answer()
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
         log_event(user_id, "paywall_shown")
-        await callback.message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
+        await callback.message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
         return
 
     await callback.answer()  # убрать "часики" на кнопке
@@ -488,7 +492,7 @@ def _build_solution_caption(quota) -> str:
             "✅ Готово · бесплатные решения закончились.\n"
             "Выбери в меню пакет 79⭐ или Premium 149⭐"
         )
-    return f"✅ Готово · осталось {remaining_after}/{settings.free_lifetime_tasks} бесплатных"
+    return f"✅ Готово · осталось {remaining_after}/{settings.free_tasks_per_week} бесплатных на неделю"
 
 
 async def _load_sol(token: str) -> dict | None:

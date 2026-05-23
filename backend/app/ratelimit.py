@@ -57,6 +57,7 @@ class QuotaResult:
         is_premium: bool = False,
         is_admin: bool = False,
         premium_until: Optional[datetime] = None,
+        free_resets_at: Optional[datetime] = None,
     ):
         self.allowed = allowed
         self.reason = reason
@@ -65,6 +66,7 @@ class QuotaResult:
         self.is_premium = is_premium
         self.is_admin = is_admin
         self.premium_until = premium_until
+        self.free_resets_at = free_resets_at
 
     @property
     def total_remaining(self) -> int:
@@ -127,9 +129,12 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
             # Новый юзер — пускаем (регистрация в /start)
             return QuotaResult(
                 allowed=True,
-                free_remaining=settings.free_lifetime_tasks,
+                free_remaining=settings.free_tasks_per_week,
                 is_premium=False,
             )
+
+        limit = settings.free_tasks_per_week
+        window = settings.free_window_days
 
         # Premium активен?
         if user.has_premium(now):
@@ -145,17 +150,18 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
             return QuotaResult(
                 allowed=True,
                 credits=user.credits,
-                free_remaining=user.free_remaining(settings.free_lifetime_tasks),
+                free_remaining=user.free_remaining(now, limit, window),
             )
 
-        # Free tier
-        remaining = user.free_remaining(settings.free_lifetime_tasks)
+        # Free tier (скользящее окно)
+        remaining = user.free_remaining(now, limit, window)
         if remaining > 0:
             return QuotaResult(
                 allowed=True,
                 free_remaining=remaining,
                 credits=0,
                 is_premium=False,
+                free_resets_at=user.free_resets_at(window),
             )
 
         return QuotaResult(
@@ -164,17 +170,22 @@ async def check_quota(telegram_id: int, username: Optional[str] = None) -> Quota
             free_remaining=0,
             credits=0,
             is_premium=False,
+            free_resets_at=user.free_resets_at(window),
         )
 
 
 async def consume_quota(telegram_id: int, username: Optional[str] = None) -> None:
     """Инкрементировать total_solved и списать одну единицу квоты.
-    Порядок списания: premium (ничего) → credits → free_used.
+    Порядок списания: premium (ничего) → credits → free (скользящее окно).
 
     Списание атомарно — одним UPDATE с CASE-выражениями. Все ветки CASE
     вычисляются против ТЕКУЩИХ значений строки (Postgres так считает SET),
     плюс строка блокируется на время апдейта — поэтому параллельные запросы
     не теряют декремент и не уводят credits в минус.
+
+    Free: если окно истекло (или ещё не открыто) — открываем новое
+    (free_window_start = NOW(), free_used = 1); иначе free_used += 1. Потолок
+    не превышается, т.к. consume вызывается только после успешного check_quota.
     """
     if is_admin(username):
         return
@@ -188,14 +199,22 @@ async def consume_quota(telegram_id: int, username: Optional[str] = None) -> Non
                 WHEN premium_until > NOW() THEN credits
                 WHEN credits > 0 THEN credits - 1
                 ELSE credits END,
+            free_window_start = CASE
+                WHEN premium_until > NOW() THEN free_window_start
+                WHEN credits > 0 THEN free_window_start
+                WHEN free_window_start IS NULL
+                     OR free_window_start <= NOW() - make_interval(days => :wd) THEN NOW()
+                ELSE free_window_start END,
             free_used = CASE
                 WHEN premium_until > NOW() THEN free_used
                 WHEN credits > 0 THEN free_used
+                WHEN free_window_start IS NULL
+                     OR free_window_start <= NOW() - make_interval(days => :wd) THEN 1
                 ELSE free_used + 1 END
         WHERE telegram_id = :tg
     """)
     async with get_session() as session:
-        await session.execute(sql, {"tg": telegram_id})
+        await session.execute(sql, {"tg": telegram_id, "wd": settings.free_window_days})
         await session.commit()
 
 

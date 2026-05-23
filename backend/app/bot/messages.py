@@ -1,11 +1,14 @@
 """Все тексты сообщений бота. HTML parse_mode."""
+from datetime import datetime
+from typing import Optional
+
 from app.config import settings
 
 
 MSG_START = (
     "👋 Привет! Я <b>Academ4I</b> — решаю задачи по матану, линалу и алгебре.\n\n"
     "📸 Кинь <b>фото задачи</b> — получишь решение в виде PDF-картинки + LaTeX-код.\n\n"
-    f"🎁 <b>{settings.free_lifetime_tasks} решения бесплатно</b>, дальше — Premium или пакеты "
+    f"🎁 <b>{settings.free_tasks_per_week} задачи в неделю бесплатно</b>, дальше — Premium или пакеты "
     "(см. меню под клавиатурой 👇).\n\n"
     "Команды:\n"
     "/help — что я умею\n"
@@ -23,7 +26,7 @@ MSG_HELP = (
     "Кидай фото задачи. Если на фото несколько задач — в подписи к фото "
     "укажи номер и подзадачу, например: <i>«реши 2851 а)»</i>.\n\n"
     f"💎 <b>Тарифы:</b>\n"
-    f"• Free — <b>{settings.free_lifetime_tasks} решения</b> (попробовать)\n"
+    f"• Free — <b>{settings.free_tasks_per_week} задачи в неделю</b> (бесплатно)\n"
     f"• Пакет — <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> (без срока)\n"
     f"• Premium — <b>30 дней безлимит за {settings.premium_price_stars}⭐</b>\n\n"
     "Поддержка: @Academ4I_support"
@@ -48,13 +51,22 @@ def msg_choose_task(task_ids: list[str]) -> str:
         f"<i>(или пришли фото с подписью — например «реши {task_ids[0]} а)»)</i>"
     )
 
-MSG_QUOTA_EXCEEDED = (
-    f"⛔ Бесплатные <b>{settings.free_lifetime_tasks} решения</b> закончились.\n\n"
-    "Хочешь продолжить — выбери в меню 👇:\n"
-    f"• 🎁 <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> "
-    "(разово, без срока)\n"
-    f"• 💎 <b>Premium {settings.premium_price_stars}⭐</b> — безлимит на 30 дней"
-)
+def msg_quota_exceeded(resets_at: Optional[datetime] = None) -> str:
+    """Paywall: бесплатный недельный лимит исчерпан (+ когда обновится)."""
+    when = ""
+    if resets_at is not None:
+        when = (
+            f"🔄 Следующие {settings.free_tasks_per_week} — "
+            f"<b>{resets_at.strftime('%d.%m в %H:%M UTC')}</b>.\n\n"
+        )
+    return (
+        f"⛔ Бесплатные <b>{settings.free_tasks_per_week} задачи на неделю</b> исчерпаны.\n\n"
+        f"{when}"
+        "Не хочешь ждать — выбери в меню 👇:\n"
+        f"• 🎁 <b>{settings.pack_tasks} задач за {settings.pack_price_stars}⭐</b> "
+        "(разово, без срока)\n"
+        f"• 💎 <b>Premium {settings.premium_price_stars}⭐</b> — безлимит на 30 дней"
+    )
 
 MSG_ERROR = (
     "😔 Что-то пошло не так. Попробуй ещё раз или пришли <b>более чёткое фото</b>.\n"
@@ -81,8 +93,10 @@ def msg_balance(quota) -> str:
     if quota.credits > 0:
         lines.append(f"🎁 Купленных задач: <b>{quota.credits}</b>")
     lines.append(
-        f"🆓 Бесплатных осталось: <b>{quota.free_remaining}/{settings.free_lifetime_tasks}</b>"
+        f"🆓 Бесплатных осталось: <b>{quota.free_remaining}/{settings.free_tasks_per_week}</b> в неделю"
     )
+    if quota.free_remaining < settings.free_tasks_per_week and quota.free_resets_at:
+        lines.append(f"🔄 Обновится: <b>{quota.free_resets_at.strftime('%d.%m в %H:%M UTC')}</b>")
     if quota.total_remaining == 0:
         lines.append("")
         lines.append("Чтобы продолжить — выбери в меню пакет или Premium 👇")
@@ -91,6 +105,14 @@ def msg_balance(quota) -> str:
 
 MSG_ADMIN_WELCOME = (
     "👑 <b>Привет, админ!</b> Безлимит решений включён.\n\n"
+)
+
+
+MSG_ADMIN_HELP = (
+    "🛠 <b>Команды админа</b>\n"
+    "/admin — панель управления\n"
+    "/stats — статистика и воронка\n"
+    "/broadcast &lt;текст&gt; — рассылка всем юзерам"
 )
 
 

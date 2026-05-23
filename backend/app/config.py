@@ -40,7 +40,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
 
     # === Тарифы ===
-    free_lifetime_tasks: int = 3       # 3 задачи бесплатно на всю жизнь аккаунта
+    # Бесплатный лимит: N задач на скользящее окно free_window_days дней.
+    # Потолок жёсткий — накопления нет (антифарм): окно стартует при первой
+    # бесплатной задаче и сбрасывается только спустя free_window_days.
+    free_tasks_per_week: int = 2
+    free_window_days: int = 7
 
     # Premium-подписка на 30 дней безлимит
     premium_price_stars: int = 149
