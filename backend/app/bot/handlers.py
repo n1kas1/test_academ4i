@@ -48,6 +48,7 @@ from app.bot.messages import (
 from app.config import settings
 from app.core.redis import get_redis
 from app.payments.tg_stars import send_pack_invoice, send_premium_invoice
+from app.analytics import log_event
 from app.ratelimit import (
     check_quota,
     check_rate_limit,
@@ -85,6 +86,7 @@ async def cmd_start(message: Message):
         first_name=user.first_name, last_name=user.last_name,
         language_code=user.language_code,
     )
+    log_event(user.id, "start")
     kb, _ = await _menu_kb(user.id, user.username)
     prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
     await message.answer(prefix + MSG_START, reply_markup=kb)
@@ -308,6 +310,7 @@ async def _solve_incoming(
     quota = await check_quota(user_id, username=username)
     if not quota.allowed:
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
+        log_event(user_id, "paywall_shown")
         await message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
         return
 
@@ -357,6 +360,7 @@ async def _solve_incoming(
             allow_resolve=True,
         )
         await consume_quota(user_id, username=username)
+        log_event(user_id, "solve")
 
     except Exception as e:
         logger.exception(f"Pipeline error for user {user_id}: {e}")
@@ -433,6 +437,7 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     if not quota.allowed:
         await callback.answer()
         kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
+        log_event(user_id, "paywall_shown")
         await callback.message.answer(MSG_QUOTA_EXCEEDED, reply_markup=kb)
         return
 
