@@ -21,7 +21,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
-TEMPLATE_VERSION = "v6"
+TEMPLATE_VERSION = "v7"
 
 # Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
 # высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
@@ -34,11 +34,15 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
-\geometry{paperwidth=14cm,paperheight=22cm,margin=0.9cm,top=0.8cm,bottom=0.8cm}
+\geometry{paperwidth=16cm,paperheight=22cm,margin=0.6cm,top=0.8cm,bottom=0.8cm}
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{0.65em}
 \renewcommand{\baselinestretch}{1.2}
+% Меньше overfull на длинных строках/формулах: тянем пробелы и допускаем
+% более свободные переносы (\sloppy), чтобы текст не вылезал за край.
+\setlength{\emergencystretch}{3em}
+\sloppy
 
 \definecolor{accent}{HTML}{1d4ed8}
 \definecolor{accentline}{HTML}{a5b4fc}

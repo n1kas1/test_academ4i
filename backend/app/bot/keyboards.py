@@ -76,7 +76,7 @@ def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardM
     )]]
     if allow_resolve:
         rows.append([InlineKeyboardButton(
-            text="🔄 Перерешать (если ответ неверный)",
+            text="🔄 Перерешать",
             callback_data=f"resolve:{token}",
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
