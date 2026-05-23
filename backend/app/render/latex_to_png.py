@@ -21,7 +21,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
-TEMPLATE_VERSION = "v7"
+TEMPLATE_VERSION = "v8"
 
 # Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
 # высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
@@ -31,6 +31,7 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[T2A]{fontenc}
 \usepackage[russian]{babel}
 \usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
+\usepackage{mathrsfs}  % \mathscr — сигма-алгебры/нотация тервера (часто у Claude)
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
