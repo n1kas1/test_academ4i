@@ -33,9 +33,20 @@ from loguru import logger
 
 # Боевые модули academ4i — единый источник промпта и RAG.
 from app.config import settings
+from app.core.db import init_db, close_db
 from app.ai.claude import SYSTEM_PROMPT
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions
+
+# pipeline.py импортит app.render.latex_to_png на верхнем уровне, а тот при импорте
+# делает mkdir("/app/render_cache") — путь контейнера, на хосте корень read-only.
+# Рендер в тесте не нужен → подсовываем заглушку до импорта pipeline (боевой код не трогаем).
+import sys as _sys
+import types as _types
+_render_stub = _types.ModuleType("app.render.latex_to_png")
+_render_stub.render_solution = None  # в тесте не вызывается
+_sys.modules["app.render.latex_to_png"] = _render_stub
+
 from app.ai.pipeline import (
     build_rag_context,
     is_complex_task,
@@ -275,6 +286,7 @@ async def run() -> None:
         raise SystemExit(f"Нет задач в {TASKS_DIR}")
     logger.info(f"Загружено задач: {len(tasks)}; моделей: {list(MODELS)}")
 
+    await init_db()  # как в lifespan прода — иначе get_session() бросит RuntimeError
     records: list[dict] = []
 
     for task in tasks:
@@ -337,6 +349,7 @@ async def run() -> None:
                 "error": res.error, "rag_top_sim": round(top_sim, 4),
             })
 
+    await close_db()
     RESULTS_JSON.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     write_summary(tasks, records)
     logger.info(f"Готово. Сводка: {SUMMARY_MD}")
@@ -345,7 +358,7 @@ async def run() -> None:
 def write_summary(tasks: list[Task], records: list[dict]) -> None:
     model_names = list(MODELS)
 
-    def cell(task_num: str, model: str, key: str):
+    def cell(task_num: str, model: str):
         for r in records:
             if r["task"] == task_num and r["model"] == model:
                 return r
