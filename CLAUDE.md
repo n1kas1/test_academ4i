@@ -58,7 +58,8 @@ curl http://localhost:8001/health
 - `payments/tg_stars.py` — Telegram Stars (подписка + разовый пакет)
 - `core/` — db (asyncpg/SQLAlchemy async), redis
 - `render/latex_to_png.py` — LaTeX → PDF → PNG через TeX Live (кэш по hash содержимого)
-- `models/` — user, solution, payment, event (+ `base.py` — declarative base, `TimestampMixin`); `ratelimit.py` — квоты и rate limit через Redis
+- `models/` — user, solution, payment, event (+ `base.py` — declarative base, `TimestampMixin`)
+- `ratelimit.py` (на уровне `app/`, не в `models/`) — квоты и rate limit через Redis; `consume_quota` — атомарное списание
 - `notify.py` — общий троттлящий рассыльщик (`send_one`/`broadcast_send`, ~20 msg/s, обработка flood-control 429). Используют и `premium_notify`, и `/broadcast`
 - `analytics.py` — fire-and-forget лог продуктовых событий (`log_event` → таблица `events`, типы: start/solve/paywall_shown). Никогда не бросает в hot-path
 - `premium_notify.py` — фоновый цикл (`premium_notifier_loop`, проверка раз в 3 ч): шлёт напоминания о Premium «скоро закончится» (≤2 дней) и «закончился» (последние 3 дня). Дедупликация — через Redis-ключи с TTL ~40 дней. Запускается из lifespan, не cron/отдельный процесс
@@ -67,7 +68,7 @@ curl http://localhost:8001/health
 
 ## Тарифы (в config.py)
 
-Free: **2 задачи на скользящее окно 7 дней** (`free_tasks_per_week` / `free_window_days`) — потолок жёсткий, без накопления (антифарм): окно открывается при первой бесплатной задаче и сбрасывается только спустя 7 дней. Дальше — подписка (149⭐/30 дней безлимит) или разовый пакет (79⭐/5 задач, без срока). Списание квоты атомарно одним `UPDATE` с CASE-выражениями (порядок: premium → credits → free), см. `consume_quota` в `ratelimit.py`. Админы (`admin_usernames`) — безлимит.
+Free: **2 задачи на скользящее окно 7 дней** (`free_tasks_per_week` / `free_window_days`) — потолок жёсткий, без накопления (антифарм): окно открывается при первой бесплатной задаче и сбрасывается только спустя 7 дней. Дальше — подписка (199⭐/30 дней или 99⭐/7 дней, безлимит) или разовый пакет (79⭐/5 задач либо 139⭐/10 задач, без срока, расходуются как credits). Списание квоты атомарно одним `UPDATE` с CASE-выражениями (порядок: premium → credits → free), см. `consume_quota` в `ratelimit.py`. Админы (`admin_usernames`) — безлимит.
 
 ## Конфиг
 
