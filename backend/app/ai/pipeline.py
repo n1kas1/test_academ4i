@@ -37,6 +37,7 @@ from loguru import logger
 
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex
+from app.ai.deepseek import solve_with_deepseek
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 from app.render.latex_to_png import render_solution
@@ -117,14 +118,21 @@ async def solve_task_from_photo(
     on_status: StatusCb = None,
     skip_cache: bool = False,
     force_thinking: bool = False,
+    mode: str = "premium",
 ) -> dict:
     """Главная точка входа из bot/handlers.py.
+
+    mode:
+        "standard" — DeepSeek v3.1 по тексту OCR (+RAG), без thinking, с кэшем.
+        "premium"  — Sonnet 4.6 (vision) + extended thinking ВСЕГДА, без кэша.
 
     on_status — async-колбэк (text) для прогресс-статуса в чате (необязателен).
 
     Возвращает dict одного из видов:
       • Нужен выбор задачи (несколько задач на фото, подсказки нет):
           {"needs_choice": True, "task_ids": ["2851", "2852"]}
+      • OCR не дал текста в standard-режиме (DeepSeek нечего решать):
+          {"ocr_failed": True}
       • Готовое решение:
           {"latex": "...", "png": bytes | None}
     """
@@ -145,9 +153,14 @@ async def solve_task_from_photo(
         logger.info(f"Multiple tasks, no hint → ask user. task_ids={task_ids}")
         return {"needs_choice": True, "task_ids": task_ids}
 
-    # 3) Если OCR провалился — fallback в простой vision-call без RAG
+    # 3) OCR провалился/короткий.
     if not condition_text or len(condition_text) < 20:
-        logger.warning(f"OCR failed/short for user {user_id}, fallback no-RAG")
+        # standard решает по тексту OCR — без него DeepSeek нечего дать.
+        if mode == "standard":
+            logger.warning(f"OCR failed/short for user {user_id}, standard → ocr_failed")
+            return {"ocr_failed": True}
+        # premium (vision): fallback в простой vision-call без RAG
+        logger.warning(f"OCR failed/short for user {user_id}, premium fallback no-RAG")
         await _status(on_status, "🧠 Решаю…")
         latex_raw = await solve_with_claude_vision(
             image_b64=image_b64,
@@ -178,13 +191,16 @@ async def solve_task_from_photo(
     # 6) Cache hit ТОЛЬКО среди готовых решений (source='generated').
     #    Учебники без решений (только условие) — не отдаём как готовый ответ.
     #    skip_cache=True (например «перерешать») → не берём из кэша, решаем заново.
-    cache_candidates = [] if skip_cache else await find_similar_solutions(
+    # Кэш готовых решений — только для standard. Premium всегда решает заново
+    # (гарантия Sonnet+thinking за 10 кредитов).
+    use_cache = (not skip_cache) and (mode == "standard")
+    cache_candidates = await find_similar_solutions(
         embedding,
         topic=topic,
         top_k=1,
         min_similarity=CACHE_HIT_THRESHOLD,
         only_generated=True,
-    )
+    ) if use_cache else []
     if cache_candidates:
         hit = cache_candidates[0]
         cached_latex = _clean_latex(hit["solution_markdown"])
@@ -208,19 +224,24 @@ async def solve_task_from_photo(
     # 7) Cache miss — собираем RAG-контекст и решаем через Claude
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
 
-    # Router: простая задача → без extended thinking (~3₽);
-    # сложная (доказательства, исследования) → с extended thinking (~5₽).
-    use_thinking = True if force_thinking else is_complex_task(condition_text)
-    logger.info(f"Router decision: complex={use_thinking} (force={force_thinking})")
-
-    await _status(on_status, "🧠 Решаю…" if not use_thinking else "🧠 Думаю над доказательством…")
-    solution_raw = await solve_with_claude_vision(
-        image_b64=image_b64,
-        media_type=media_type,
-        user_hint=user_hint,
-        rag_context=rag_context,
-        use_thinking=use_thinking,
-    )
+    # Выбор солвера по режиму.
+    if mode == "standard":
+        await _status(on_status, "🧠 Решаю…")
+        solution_raw = await solve_with_deepseek(
+            condition_text=condition_text,
+            rag_context=rag_context,
+            user_hint=user_hint,
+        )
+    else:
+        # premium: Sonnet + extended thinking ВСЕГДА (это и есть «премиум»).
+        await _status(on_status, "🧠 Думаю над решением…")
+        solution_raw = await solve_with_claude_vision(
+            image_b64=image_b64,
+            media_type=media_type,
+            user_hint=user_hint,
+            rag_context=rag_context,
+            use_thinking=True,
+        )
     latex_clean = _clean_latex(solution_raw)
 
     # 8) Сохраняем LaTeX в кэш для будущих юзеров

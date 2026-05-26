@@ -1,7 +1,7 @@
-"""Telegram Stars — две покупки:
+"""Telegram Stars — покупка пакетов кредитов (credit-модель).
 
-  PAYLOAD_PREMIUM = 30 дней безлимита за settings.premium_price_stars (149)
-  PAYLOAD_PACK    = settings.pack_tasks разовых решений за settings.pack_price_stars (79)
+Каждый пакет (см. config.CREDIT_PACKAGES) → начисление credits. Подписок больше
+нет. Начисление идемпотентно по telegram_payment_charge_id.
 """
 from aiogram import Bot, F, Router
 from aiogram.types import (
@@ -14,75 +14,35 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.bot.keyboards import main_menu_keyboard
-from app.config import settings
+from app.config import CreditPackage, PACKAGES_BY_PAYLOAD, settings
 from app.core.db import get_session
-from app.ratelimit import activate_premium, add_credits, is_admin
+from app.ratelimit import add_credits, is_admin
 
 router = Router()
 
-PAYLOAD_PREMIUM = "academ4i_premium_30d"
-PAYLOAD_PREMIUM_WEEK = "academ4i_premium_7d"
-PAYLOAD_PACK = "academ4i_pack_5"
-PAYLOAD_PACK10 = "academ4i_pack_10"
-
-# payload → (product-метка для БД, тип "premium"/"pack", количество дней/задач).
-_GRANTS = {
-    PAYLOAD_PREMIUM:      ("premium_30d", "premium", settings.premium_duration_days),
-    PAYLOAD_PREMIUM_WEEK: ("premium_7d",  "premium", settings.premium_week_days),
-    PAYLOAD_PACK:         ("pack_5",      "pack",    settings.pack_tasks),
-    PAYLOAD_PACK10:       ("pack_10",     "pack",    settings.pack_large_tasks),
-}
+_PACKAGES_BY_KEY: dict[str, CreditPackage] = {p.key: p for p in PACKAGES_BY_PAYLOAD.values()}
 
 
-async def _send_invoice(bot: Bot, chat_id: int, title: str, desc: str, payload: str, amount: int) -> None:
+async def send_credits_invoice(bot: Bot, chat_id: int, pkg: CreditPackage) -> None:
+    """Выставить счёт на пакет кредитов."""
     await bot.send_invoice(
-        chat_id=chat_id, title=title, description=desc, payload=payload,
-        currency="XTR", prices=[LabeledPrice(label=title, amount=amount)],
-    )
-
-
-async def send_premium_invoice(bot: Bot, chat_id: int) -> None:
-    """Premium на 30 дней (безлимит в рамках дневного fair-use)."""
-    await _send_invoice(
-        bot, chat_id, "Academ4I — Premium 30 дней",
-        f"Безлимит решений на 30 дней (до {settings.premium_daily_cap} задач/день). "
-        "Матан, линал, алгебра, тервер, дискретка.",
-        PAYLOAD_PREMIUM, settings.premium_price_stars,
-    )
-
-
-async def send_premium_week_invoice(bot: Bot, chat_id: int) -> None:
-    """Premium на 7 дней — под сессию."""
-    await _send_invoice(
-        bot, chat_id, "Academ4I — Premium 7 дней",
-        f"Безлимит решений на 7 дней (до {settings.premium_daily_cap} задач/день). "
-        "Идеально на сессию.",
-        PAYLOAD_PREMIUM_WEEK, settings.premium_week_price_stars,
-    )
-
-
-async def send_pack_invoice(bot: Bot, chat_id: int) -> None:
-    """Пакет 5 задач без срока."""
-    await _send_invoice(
-        bot, chat_id, f"Academ4I — Пакет {settings.pack_tasks} задач",
-        f"{settings.pack_tasks} решений сверх бесплатных. Без срока — используй когда нужно.",
-        PAYLOAD_PACK, settings.pack_price_stars,
-    )
-
-
-async def send_pack10_invoice(bot: Bot, chat_id: int) -> None:
-    """Пакет 10 задач без срока."""
-    await _send_invoice(
-        bot, chat_id, f"Academ4I — Пакет {settings.pack_large_tasks} задач",
-        f"{settings.pack_large_tasks} решений сверх бесплатных. Без срока — используй когда нужно.",
-        PAYLOAD_PACK10, settings.pack_large_price_stars,
+        chat_id=chat_id,
+        title=f"Academ4I — {pkg.title} ({pkg.credits} кредитов)",
+        description=(
+            f"{pkg.credits} кредитов без срока. "
+            f"Стандарт — {settings.standard_cost} кредит/задача, "
+            f"Премиум — {settings.premium_cost} кредитов/задача."
+        ),
+        payload=pkg.payload,
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{pkg.credits} кредитов", amount=pkg.stars)],
     )
 
 
 @router.pre_checkout_query()
 async def on_pre_checkout(query: PreCheckoutQuery, bot: Bot):
-    """Подтверждение перед списанием. OK для известных payload."""
-    if query.invoice_payload in _GRANTS:
+    """Подтверждение перед списанием. OK для известных пакетов."""
+    if query.invoice_payload in PACKAGES_BY_PAYLOAD:
         logger.info(
             f"pre_checkout OK: user={query.from_user.id} "
             f"payload={query.invoice_payload} amount={query.total_amount}"
@@ -98,12 +58,11 @@ async def on_pre_checkout(query: PreCheckoutQuery, bot: Bot):
 
 @router.message(F.successful_payment)
 async def on_successful_payment(message: Message):
-    """Платёж прошёл — активируем покупку. Идемпотентно по charge_id.
+    """Платёж прошёл — начисляем кредиты. Идемпотентно по charge_id.
 
-    Начисление и запись в payments — в одной транзакции: сначала «столбим»
-    платёж (INSERT ... ON CONFLICT DO NOTHING RETURNING id), и только если
-    вставка реально произошла — начисляем. Дубль вебхука от Telegram второй
-    раз ничего не начислит.
+    Сначала «столбим» платёж (INSERT ... ON CONFLICT DO NOTHING RETURNING id),
+    и только если вставка реально произошла — начисляем. Дубль вебхука от
+    Telegram второй раз ничего не начислит.
     """
     sp = message.successful_payment
     user_id = message.from_user.id
@@ -115,19 +74,22 @@ async def on_successful_payment(message: Message):
         f"amount={sp.total_amount} {sp.currency} charge_id={charge_id}"
     )
 
-    grant = _GRANTS.get(payload)
-    if grant is None:
+    pkg = PACKAGES_BY_PAYLOAD.get(payload)
+    if pkg is None:
         logger.error(f"successful_payment with unknown payload: {payload}")
-        await message.answer("Платёж прошёл, но мы не смогли распознать что куплено. Напиши в @Academ4I_support.")
+        await message.answer(
+            "Платёж прошёл, но мы не смогли распознать что куплено. "
+            "Напиши в @Academ4I_support."
+        )
         return
-    product, kind, qty = grant
 
-    premium_until = None
     new_credits = None
     duplicate = False
 
     async with get_session() as session:
         # 1) Идемпотентный «захват» платежа по уникальному charge_id.
+        #    premium_from/until — NOT NULL в схеме (наследие подписок); для пакетов
+        #    кладём NOW() как заглушку, чтобы не менять схему.
         claim = await session.execute(text("""
             INSERT INTO payments (
                 telegram_id, telegram_payment_charge_id, amount_stars,
@@ -135,81 +97,43 @@ async def on_successful_payment(message: Message):
             ) VALUES (:tg, :charge, :amt, :product, NOW(), NOW(), 'processing')
             ON CONFLICT (telegram_payment_charge_id) DO NOTHING
             RETURNING id
-        """), {"tg": user_id, "charge": charge_id, "amt": sp.total_amount, "product": product})
+        """), {"tg": user_id, "charge": charge_id, "amt": sp.total_amount, "product": pkg.key})
         claimed = claim.first()
 
         if claimed is None:
-            # Этот платёж уже обрабатывали — повторно НЕ начисляем.
             duplicate = True
         else:
             payment_id = claimed[0]
-            # 2) Начисление в той же транзакции, что и запись платежа.
-            if kind == "premium":
-                premium_until = await activate_premium(user_id, duration_days=qty, session=session)
-                await session.execute(text(
-                    "UPDATE payments SET premium_until = :until, status = 'succeeded' WHERE id = :id"
-                ), {"until": premium_until, "id": payment_id})
-            else:  # pack
-                new_credits = await add_credits(user_id, qty, session=session)
-                await session.execute(text(
-                    "UPDATE payments SET status = 'succeeded' WHERE id = :id"
-                ), {"id": payment_id})
+            # 2) Начисление кредитов в той же транзакции, что и запись платежа.
+            new_credits = await add_credits(user_id, pkg.credits, session=session)
+            await session.execute(text(
+                "UPDATE payments SET status = 'succeeded' WHERE id = :id"
+            ), {"id": payment_id})
             await session.commit()
 
     if duplicate:
         logger.warning(f"Duplicate successful_payment ignored: user={user_id} charge_id={charge_id}")
-        kb = main_menu_keyboard(is_admin=is_admin(message.from_user.username))
         await message.answer(
             "✅ Этот платёж уже был активирован ранее — повторно начислять не нужно.",
-            reply_markup=kb,
+            reply_markup=main_menu_keyboard(is_admin=is_admin(message.from_user.username)),
         )
         return
 
-    if kind == "premium":
-        result_text = (
-            f"✅ <b>Premium активирован!</b>\n\n"
-            f"Безлимит (до {settings.premium_daily_cap} задач/день) до "
-            f"<b>{premium_until.strftime('%d.%m.%Y %H:%M UTC')}</b>.\n\n"
-            f"Кидай задачи 🎓"
-        )
-        is_premium_now = True
-    else:
-        result_text = (
-            f"✅ <b>Пакет {qty} задач куплен!</b>\n\n"
-            f"Доступно решений: <b>{new_credits}</b> (без срока истечения).\n\n"
-            f"Кидай задачи 🎓"
-        )
-        is_premium_now = False
-
-    # После Premium-покупки — клавиатура без кнопок покупки; после пакета — обычное меню.
-    kb = main_menu_keyboard(
-        is_premium=is_premium_now,
-        is_admin=is_admin(message.from_user.username),
+    await message.answer(
+        f"✅ <b>Пакет {pkg.title} куплен!</b>\n\n"
+        f"Начислено <b>{pkg.credits}</b> кредитов. Баланс: <b>{new_credits}</b> (без срока).\n\n"
+        f"Кидай задачи 🎓",
+        reply_markup=main_menu_keyboard(is_admin=is_admin(message.from_user.username)),
     )
-    await message.answer(result_text, reply_markup=kb)
 
 
-# === Выбор тарифа из inline-меню (buy:*) ===
-
-@router.callback_query(F.data == "buy:premmonth")
-async def cb_buy_premmonth(callback: CallbackQuery, bot: Bot):
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy_package(callback: CallbackQuery, bot: Bot):
+    """Выбор пакета из inline-меню (buy:<key>)."""
     await callback.answer()
-    await send_premium_invoice(bot, callback.message.chat.id)
-
-
-@router.callback_query(F.data == "buy:premweek")
-async def cb_buy_premweek(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    await send_premium_week_invoice(bot, callback.message.chat.id)
-
-
-@router.callback_query(F.data == "buy:pack5")
-async def cb_buy_pack5(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    await send_pack_invoice(bot, callback.message.chat.id)
-
-
-@router.callback_query(F.data == "buy:pack10")
-async def cb_buy_pack10(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    await send_pack10_invoice(bot, callback.message.chat.id)
+    key = callback.data.split(":", 1)[1]
+    pkg = _PACKAGES_BY_KEY.get(key)
+    if pkg is None:
+        await callback.message.answer("Пакет не найден, открой меню заново.")
+        return
+    await send_credits_invoice(bot, callback.message.chat.id, pkg)

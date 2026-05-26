@@ -1,4 +1,6 @@
 """Настройки приложения. Грузим из .env через pydantic-settings."""
+from dataclasses import dataclass
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +32,12 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     parser_model: str = "gpt-4o"
 
+    # === DeepSeek (standard-режим) — через OpenAI-совместимый шлюз ProxyAPI ===
+    # Шлюз маршрутизирует по префиксу модели (openrouter/<provider>/<model>).
+    # Отличается от openai_base_url (тот — чистый OpenAI passthrough для эмбеддингов).
+    deepseek_model: str = "openrouter/deepseek/deepseek-chat-v3.1"
+    openai_compat_base_url: str = "https://openai.api.proxyapi.ru/v1"
+
     # === Postgres ===
     database_url: str
     supabase_url: str = ""
@@ -60,6 +68,12 @@ class Settings(BaseSettings):
     pack_large_price_stars: int = 139
     pack_large_tasks: int = 10
 
+    # === Credit-based pricing (новая модель) ===
+    # Вес режимов — сколько кредитов списывается за одно решение.
+    standard_cost: int = 1      # DeepSeek v3.1 (текст после Haiku-OCR)
+    premium_cost: int = 10      # Sonnet 4.6 + extended thinking (vision)
+    trial_credits: int = 5      # начисляется новому юзеру при первом /start
+
     # === Админы (безлимит) — usernames через запятую без @ ===
     admin_usernames: str = "manag31"
 
@@ -78,3 +92,25 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# === Каталог пакетов кредитов (Telegram Stars) ===
+
+@dataclass(frozen=True)
+class CreditPackage:
+    key: str        # внутренний идентификатор
+    title: str      # отображаемое имя
+    credits: int    # сколько кредитов начисляется
+    stars: int      # цена в Telegram Stars
+    payload: str    # invoice payload (идемпотентность платежа)
+
+
+CREDIT_PACKAGES: list[CreditPackage] = [
+    CreditPackage("sok",      "Sok",      10,  79,   "academ4i_credits_sok"),
+    CreditPackage("mini",     "Mini",     25,  149,  "academ4i_credits_mini"),
+    CreditPackage("standard", "Standard", 75,  399,  "academ4i_credits_standard"),
+    CreditPackage("large",    "Large",    200, 899,  "academ4i_credits_large"),
+    CreditPackage("mega",     "Mega",     500, 1990, "academ4i_credits_mega"),
+]
+
+PACKAGES_BY_PAYLOAD: dict[str, CreditPackage] = {p.payload: p for p in CREDIT_PACKAGES}
