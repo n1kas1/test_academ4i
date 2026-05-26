@@ -6,11 +6,12 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from app.config import settings
+from app.config import settings, CREDIT_PACKAGES
 
 # === Тексты кнопок главного меню ===
-BTN_BUY_PACK = "🎁 Пакеты задач"
-BTN_BUY_PREMIUM = "💎 Premium"
+BTN_BUY_PACK = "🎁 Пакеты задач"          # legacy (старая модель)
+BTN_BUY_PREMIUM = "💎 Premium"            # legacy (старая модель)
+BTN_BUY_CREDITS = "💳 Пакеты кредитов"
 BTN_BALANCE = "📊 Мой баланс"
 BTN_HELP = "ℹ️ Помощь"
 
@@ -44,13 +45,16 @@ def premium_choice_keyboard() -> InlineKeyboardMarkup:
 
 
 def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> ReplyKeyboardMarkup:
-    """Главное меню. Если у юзера активен Premium / он админ — кнопки покупки скрыты."""
-    if is_premium or is_admin:
+    """Главное меню (credit-модель). Админ → без кнопки покупки.
+
+    Параметр is_premium сохранён для совместимости вызовов, в credit-модели не влияет.
+    """
+    if is_admin:
         keyboard = [[KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HELP)]]
-        placeholder = "📸 Кинь фото задачи (безлимит активен)"
+        placeholder = "📸 Кинь фото задачи (админ — безлимит)"
     else:
         keyboard = [
-            [KeyboardButton(text=BTN_BUY_PACK), KeyboardButton(text=BTN_BUY_PREMIUM)],
+            [KeyboardButton(text=BTN_BUY_CREDITS)],
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HELP)],
         ]
         placeholder = "📸 Кинь фото задачи или выбери из меню"
@@ -61,6 +65,31 @@ def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> Repl
         input_field_placeholder=placeholder,
         is_persistent=True,
     )
+
+
+def packages_keyboard() -> InlineKeyboardMarkup:
+    """Inline-выбор пакета кредитов (callback buy:<key>)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{p.title} — {p.credits} кредитов · {p.stars}⭐",
+            callback_data=f"buy:{p.key}",
+        )]
+        for p in CREDIT_PACKAGES
+    ])
+
+
+def mode_choice_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Inline-выбор режима перед решением (callback mode:<token>:<standard|premium>)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"⚡ Стандарт · {settings.standard_cost} кредит",
+            callback_data=f"mode:{token}:standard",
+        )],
+        [InlineKeyboardButton(
+            text=f"💎 Премиум · {settings.premium_cost} кредитов",
+            callback_data=f"mode:{token}:premium",
+        )],
+    ])
 
 
 def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup:
