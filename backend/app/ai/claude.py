@@ -26,12 +26,12 @@ def get_client() -> AsyncAnthropic:
     return _client
 
 
-# Стоимость токенов в ₽ за 1M (вход / выход). Откалибровано 2026-05-23 под факт
-# ProxyAPI: thinking-задача in=4709/out=5000 списала ~14₽ → ставки ×~1.65 от
-# базовых Anthropic-цен. Картинки vision = входные токены; thinking = выходные.
+# Стоимость токенов в ₽ за 1M (вход / выход). Сверено с прайс-листом ProxyAPI
+# на 2026-05-26 (см. test_results — public pricing). Картинки vision = входные
+# токены; extended thinking = выходные.
 _RUB_PER_MTOK = {
-    "haiku":  (150, 750),
-    "sonnet": (450, 2250),
+    "haiku":  (295, 1474),
+    "sonnet": (774, 3866),
 }
 
 
