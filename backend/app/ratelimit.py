@@ -1,9 +1,8 @@
-"""Rate limit + проверка квоты Free/Premium + админ-bypass.
+"""Rate limit + кредитная квота + админ-bypass.
 
 Админы (settings.admin_usernames_set) обходят все лимиты — безлимит решений.
 """
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
@@ -45,35 +44,7 @@ def is_admin(username: Optional[str]) -> bool:
     return username.lower().lstrip("@") in settings.admin_usernames_set
 
 
-# === Квота (БД) ===
-
-class QuotaResult:
-    """Результат проверки квоты."""
-    def __init__(
-        self,
-        allowed: bool,
-        reason: str = "",
-        free_remaining: int = 0,
-        credits: int = 0,
-        is_premium: bool = False,
-        is_admin: bool = False,
-        premium_until: Optional[datetime] = None,
-        free_resets_at: Optional[datetime] = None,
-    ):
-        self.allowed = allowed
-        self.reason = reason
-        self.free_remaining = free_remaining
-        self.credits = credits
-        self.is_premium = is_premium
-        self.is_admin = is_admin
-        self.premium_until = premium_until
-        self.free_resets_at = free_resets_at
-
-    @property
-    def total_remaining(self) -> int:
-        """Сколько решений всего доступно (credits + free)."""
-        return self.credits + self.free_remaining
-
+# === Пользователь ===
 
 async def get_or_create_user(
     telegram_id: int,
@@ -101,7 +72,6 @@ async def get_or_create_user(
             await session.refresh(user)
             logger.info(f"New user: {telegram_id} @{username} (trial +{settings.trial_credits} credits)")
         else:
-            # обновляем username/имя если поменялись
             changed = False
             if username and user.username != username:
                 user.username = username
@@ -117,137 +87,7 @@ async def get_or_create_user(
         return user
 
 
-def _premium_cap_key(telegram_id: int, now: datetime) -> str:
-    """Ключ дневного fair-use счётчика Premium (UTC-сутки)."""
-    return f"premcap:{telegram_id}:{now:%Y%m%d}"
-
-
-async def check_quota(telegram_id: int, username: Optional[str] = None) -> QuotaResult:
-    """Проверить может ли юзер сделать запрос."""
-    now = datetime.now(timezone.utc)
-
-    # Админ → безлимит мгновенно
-    if is_admin(username):
-        return QuotaResult(allowed=True, is_admin=True)
-
-    async with get_session() as session:
-        stmt = select(User).where(User.telegram_id == telegram_id)
-        user = (await session.execute(stmt)).scalar_one_or_none()
-        if user is None:
-            # Новый юзер — пускаем (регистрация в /start)
-            return QuotaResult(
-                allowed=True,
-                free_remaining=settings.free_tasks_per_week,
-                is_premium=False,
-            )
-
-        limit = settings.free_tasks_per_week
-        window = settings.free_window_days
-
-        # Premium активен? Безлимит, но в рамках дневного fair-use лимита.
-        if user.has_premium(now):
-            used_today = int(await get_redis().get(_premium_cap_key(telegram_id, now)) or 0)
-            if used_today >= settings.premium_daily_cap:
-                return QuotaResult(
-                    allowed=False,
-                    reason="premium_daily_cap",
-                    is_premium=True,
-                    premium_until=user.premium_until,
-                )
-            return QuotaResult(
-                allowed=True,
-                is_premium=True,
-                premium_until=user.premium_until,
-                credits=user.credits,
-            )
-
-        # Купленные credits идут первыми
-        if user.credits > 0:
-            return QuotaResult(
-                allowed=True,
-                credits=user.credits,
-                free_remaining=user.free_remaining(now, limit, window),
-                free_resets_at=user.free_resets_at(window),
-            )
-
-        # Free tier (скользящее окно)
-        remaining = user.free_remaining(now, limit, window)
-        if remaining > 0:
-            return QuotaResult(
-                allowed=True,
-                free_remaining=remaining,
-                credits=0,
-                is_premium=False,
-                free_resets_at=user.free_resets_at(window),
-            )
-
-        return QuotaResult(
-            allowed=False,
-            reason="free_exhausted",
-            free_remaining=0,
-            credits=0,
-            is_premium=False,
-            free_resets_at=user.free_resets_at(window),
-        )
-
-
-async def consume_quota(telegram_id: int, username: Optional[str] = None) -> None:
-    """Инкрементировать total_solved и списать одну единицу квоты.
-    Порядок списания: premium (ничего) → credits → free (скользящее окно).
-
-    Списание атомарно — одним UPDATE с CASE-выражениями. Все ветки CASE
-    вычисляются против ТЕКУЩИХ значений строки (Postgres так считает SET),
-    плюс строка блокируется на время апдейта — поэтому параллельные запросы
-    не теряют декремент и не уводят credits в минус.
-
-    Free: если окно истекло (или ещё не открыто) — открываем новое
-    (free_window_start = NOW(), free_used = 1); иначе free_used += 1. Потолок
-    не превышается, т.к. consume вызывается только после успешного check_quota.
-    """
-    if is_admin(username):
-        return
-
-    # NULL premium_until: `NULL > NOW()` → NULL → ветка не матчится → идём дальше
-    # (т.е. отсутствие подписки трактуется как "не premium"). Это и нужно.
-    sql = text("""
-        UPDATE users SET
-            total_solved = total_solved + 1,
-            credits = CASE
-                WHEN premium_until > NOW() THEN credits
-                WHEN credits > 0 THEN credits - 1
-                ELSE credits END,
-            free_window_start = CASE
-                WHEN premium_until > NOW() THEN free_window_start
-                WHEN credits > 0 THEN free_window_start
-                WHEN free_window_start IS NULL
-                     OR free_window_start <= NOW() - make_interval(days => :wd) THEN NOW()
-                ELSE free_window_start END,
-            free_used = CASE
-                WHEN premium_until > NOW() THEN free_used
-                WHEN credits > 0 THEN free_used
-                WHEN free_window_start IS NULL
-                     OR free_window_start <= NOW() - make_interval(days => :wd) THEN 1
-                ELSE free_used + 1 END
-        WHERE telegram_id = :tg
-        RETURNING premium_until
-    """)
-    async with get_session() as session:
-        row = (await session.execute(sql, {"tg": telegram_id, "wd": settings.free_window_days})).first()
-        await session.commit()
-
-    # Premium-консьюм (квота в БД не тронута) → инкремент дневного fair-use счётчика.
-    now = datetime.now(timezone.utc)
-    if row and row[0] and row[0] > now:
-        redis = get_redis()
-        key = _premium_cap_key(telegram_id, now)
-        if await redis.incr(key) == 1:
-            await redis.expire(key, 48 * 3600)
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Credit-based pricing (новая модель). Старые check_quota/consume_quota выше
-# оставлены временно и будут удалены в коммите очистки подписок.
-# ════════════════════════════════════════════════════════════════════════
+# === Кредитная квота ===
 
 @dataclass
 class CreditStatus:
@@ -296,6 +136,8 @@ async def consume_credits(telegram_id: int, cost: int, username: Optional[str] =
     return False
 
 
+# === Начисление кредитов (после оплаты пакета) ===
+
 async def _apply_credits(session, telegram_id: int, amount: int) -> int:
     """Начислить credits в рамках переданной сессии. Коммитит вызывающий."""
     stmt = select(User).where(User.telegram_id == telegram_id)
@@ -311,7 +153,7 @@ async def _apply_credits(session, telegram_id: int, amount: int) -> int:
 
 
 async def add_credits(telegram_id: int, amount: int, session=None) -> int:
-    """Начислить N задач юзеру (после оплаты пакета). Возвращает новое значение credits.
+    """Начислить N кредитов юзеру (после оплаты пакета). Возвращает новое значение credits.
 
     Если передана session — работает в ней без коммита (коммитит вызывающий,
     чтобы начисление было атомарно с записью платежа). Иначе — своя транзакция.
@@ -322,34 +164,4 @@ async def add_credits(telegram_id: int, amount: int, session=None) -> int:
         result = await _apply_credits(s, telegram_id, amount)
         await s.commit()
         logger.info(f"Credits +{amount} for {telegram_id}, total={result}")
-        return result
-
-
-async def _apply_premium(session, telegram_id: int, duration_days: int) -> datetime:
-    """Активировать/продлить Premium в рамках переданной сессии. Коммитит вызывающий."""
-    now = datetime.now(timezone.utc)
-    stmt = select(User).where(User.telegram_id == telegram_id)
-    user = (await session.execute(stmt)).scalar_one_or_none()
-    if user is None:
-        # Юзера ещё нет — создаём заглушку. Должен быть редкий случай.
-        user = User(telegram_id=telegram_id)
-        session.add(user)
-    # Активная подписка → продлеваем от premium_until; иначе → от текущего момента.
-    base = user.premium_until if user.premium_until and user.premium_until > now else now
-    user.premium_until = base + timedelta(days=duration_days)
-    await session.flush()
-    return user.premium_until
-
-
-async def activate_premium(telegram_id: int, duration_days: int = 30, session=None) -> datetime:
-    """Активировать/продлить Premium юзера. Возвращает новую дату окончания.
-
-    Если передана session — работает в ней без коммита (см. add_credits).
-    """
-    if session is not None:
-        return await _apply_premium(session, telegram_id, duration_days)
-    async with get_session() as s:
-        result = await _apply_premium(s, telegram_id, duration_days)
-        await s.commit()
-        logger.info(f"Premium activated: {telegram_id} until {result}")
         return result

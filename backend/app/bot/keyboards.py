@@ -9,39 +9,9 @@ from aiogram.types import (
 from app.config import settings, CREDIT_PACKAGES
 
 # === Тексты кнопок главного меню ===
-BTN_BUY_PACK = "🎁 Пакеты задач"          # legacy (старая модель)
-BTN_BUY_PREMIUM = "💎 Premium"            # legacy (старая модель)
 BTN_BUY_CREDITS = "💳 Пакеты кредитов"
 BTN_BALANCE = "📊 Мой баланс"
 BTN_HELP = "ℹ️ Помощь"
-
-
-def pack_choice_keyboard() -> InlineKeyboardMarkup:
-    """Inline-выбор пакета задач (без срока)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🎁 {settings.pack_tasks} задач — {settings.pack_price_stars}⭐",
-            callback_data="buy:pack5",
-        )],
-        [InlineKeyboardButton(
-            text=f"🎁 {settings.pack_large_tasks} задач — {settings.pack_large_price_stars}⭐",
-            callback_data="buy:pack10",
-        )],
-    ])
-
-
-def premium_choice_keyboard() -> InlineKeyboardMarkup:
-    """Inline-выбор периода Premium."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"💎 Неделя — {settings.premium_week_price_stars}⭐",
-            callback_data="buy:premweek",
-        )],
-        [InlineKeyboardButton(
-            text=f"💎 Месяц — {settings.premium_price_stars}⭐",
-            callback_data="buy:premmonth",
-        )],
-    ])
 
 
 def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> ReplyKeyboardMarkup:
@@ -109,13 +79,6 @@ def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardM
             callback_data=f"resolve:{token}",
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def renew_premium_keyboard() -> InlineKeyboardMarkup:
-    """Inline-кнопка под уведомлением об окончании Premium."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💎 Продлить Premium", callback_data="renew_premium"),
-    ]])
 
 
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:
