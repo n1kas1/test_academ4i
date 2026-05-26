@@ -2,6 +2,7 @@
 
 Админы (settings.admin_usernames_set) обходят все лимиты — безлимит решений.
 """
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -86,17 +87,19 @@ async def get_or_create_user(
         stmt = select(User).where(User.telegram_id == telegram_id)
         user = (await session.execute(stmt)).scalar_one_or_none()
         if user is None:
+            # Новому юзеру — trial-кредиты (один раз, при создании).
             user = User(
                 telegram_id=telegram_id,
                 username=username,
                 first_name=first_name,
                 last_name=last_name,
                 language_code=language_code,
+                credits=settings.trial_credits,
             )
             session.add(user)
             await session.commit()
             await session.refresh(user)
-            logger.info(f"New user: {telegram_id} @{username}")
+            logger.info(f"New user: {telegram_id} @{username} (trial +{settings.trial_credits} credits)")
         else:
             # обновляем username/имя если поменялись
             changed = False
@@ -239,6 +242,58 @@ async def consume_quota(telegram_id: int, username: Optional[str] = None) -> Non
         key = _premium_cap_key(telegram_id, now)
         if await redis.incr(key) == 1:
             await redis.expire(key, 48 * 3600)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Credit-based pricing (новая модель). Старые check_quota/consume_quota выше
+# оставлены временно и будут удалены в коммите очистки подписок.
+# ════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CreditStatus:
+    """Баланс кредитов юзера для UI и проверок."""
+    credits: int = 0
+    is_admin: bool = False
+
+    def can_afford(self, cost: int) -> bool:
+        return self.is_admin or self.credits >= cost
+
+
+async def get_credit_status(telegram_id: int, username: Optional[str] = None) -> CreditStatus:
+    """Текущий баланс кредитов (админ → безлимит)."""
+    if is_admin(username):
+        return CreditStatus(is_admin=True)
+    async with get_session() as session:
+        user = (await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )).scalar_one_or_none()
+        return CreditStatus(credits=(user.credits if user else 0))
+
+
+async def consume_credits(telegram_id: int, cost: int, username: Optional[str] = None) -> bool:
+    """Атомарно списать `cost` кредитов и инкрементировать total_solved.
+
+    Возвращает True если списано, False если не хватило. Условие `credits >= cost`
+    в самом UPDATE + блокировка строки → параллельные запросы не уводят в минус.
+    Админ → безлимит: ничего не списываем, всегда True.
+    """
+    if is_admin(username):
+        return True
+    sql = text("""
+        UPDATE users
+        SET credits = credits - :cost,
+            total_solved = total_solved + 1
+        WHERE telegram_id = :tg AND credits >= :cost
+        RETURNING credits
+    """)
+    async with get_session() as session:
+        row = (await session.execute(sql, {"tg": telegram_id, "cost": cost})).first()
+        await session.commit()
+    if row is not None:
+        logger.info(f"Credits -{cost} for {telegram_id}, left={row[0]}")
+        return True
+    logger.info(f"Insufficient credits for {telegram_id} (need {cost})")
+    return False
 
 
 async def _apply_credits(session, telegram_id: int, amount: int) -> int:
