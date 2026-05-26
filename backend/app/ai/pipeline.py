@@ -36,10 +36,35 @@ from typing import Awaitable, Callable, Optional
 from loguru import logger
 
 from app.ai.vision import prepare_image
-from app.ai.claude import solve_with_claude_vision, extract_condition_text
+from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 from app.render.latex_to_png import render_solution
+
+
+async def _render_with_autofix(latex: str) -> tuple[dict, str]:
+    """Рендер; при ошибке компиляции pdflatex — один авто-фикс LaTeX (Haiku) и повтор.
+
+    Возвращает (rendered, final_latex). Если фикс удался — final_latex исправленный
+    (он же уйдёт в кнопку «Показать LaTeX»); иначе исходный (для текстового фолбэка).
+    """
+    rendered = await render_solution(latex)
+    if rendered["pdf"] or not rendered.get("error"):
+        return rendered, latex
+    logger.warning("render failed — пробую авто-фикс LaTeX через Haiku")
+    try:
+        fixed = await fix_latex(latex, rendered["error"])
+    except Exception as e:
+        logger.warning(f"fix_latex failed: {e}")
+        return rendered, latex
+    if not fixed or fixed.strip() == latex.strip():
+        return rendered, latex
+    rerendered = await render_solution(fixed)
+    if rerendered["pdf"]:
+        logger.info("LaTeX авто-фикс удался → PDF собран")
+        return rerendered, fixed
+    logger.warning("авто-фикс не помог — текстовый фолбэк")
+    return rendered, latex
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
 RAG_MIN_SIMILARITY = 0.65
@@ -132,7 +157,7 @@ async def solve_task_from_photo(
         )
         latex_clean = _clean_latex(latex_raw)
         await _status(on_status, "🖼 Оформляю решение…")
-        rendered = await render_solution(latex_clean)
+        rendered, latex_clean = await _render_with_autofix(latex_clean)
         return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
     # 4) Классификация темы (для фильтрации retrieval)
@@ -172,7 +197,7 @@ async def solve_task_from_photo(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            rendered = await render_solution(cached_latex)
+            rendered, cached_latex = await _render_with_autofix(cached_latex)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
         else:
             logger.info(
@@ -212,9 +237,9 @@ async def solve_task_from_photo(
     except Exception as e:
         logger.warning(f"save_solution failed (non-fatal): {e}")
 
-    # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого)
+    # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого) + авто-фикс при ошибке
     await _status(on_status, "🖼 Оформляю решение…")
-    rendered = await render_solution(latex_clean)
+    rendered, latex_clean = await _render_with_autofix(latex_clean)
 
     logger.info(
         f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, "

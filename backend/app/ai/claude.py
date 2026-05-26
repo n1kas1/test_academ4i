@@ -311,3 +311,46 @@ async def solve_with_claude_vision(
     )
 
     return solution_text.strip()
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 3) Авто-фикс LaTeX, который не скомпилировался pdflatex (дешёвый, на Haiku)
+# ───────────────────────────────────────────────────────────────────────
+
+_FIX_LATEX_SYSTEM = r"""Ты чинишь LaTeX-фрагмент решения, который НЕ скомпилировался pdflatex.
+Тебе дают сообщение об ошибке и сам фрагмент. Исправь ТОЛЬКО синтаксис:
+- баланс $...$ и $$...$$, парные \left … \right, фигурные {} и обычные () скобки;
+- математические команды (\frac, \tfrac, \;, \cup, \mathscr, \boldsymbol и т.п.)
+  должны быть ВНУТРИ математического режима;
+- русский текст внутри формул — в \text{...}.
+Доступные пакеты: amsmath, amssymb, amsthm, amsfonts, mathtools, mathrsfs.
+Команды \hd{...} и \ans{...} оставь как есть. НЕ меняй смысл и текст решения, не добавляй пояснений.
+Верни ТОЛЬКО исправленный LaTeX-фрагмент — без markdown-обёрток и комментариев."""
+
+
+async def fix_latex(broken_latex: str, error_log: str) -> str:
+    """Починить невалидный LaTeX по логу ошибки pdflatex. Haiku — дёшево.
+
+    Возвращает исправленный фрагмент (или исходный, если модель ничего не дала).
+    """
+    client = get_client()
+    user_msg = (
+        f"Ошибка pdflatex:\n{error_log[-1500:]}\n\n"
+        f"LaTeX-фрагмент (почини и верни целиком):\n{broken_latex}"
+    )
+    response = await client.messages.create(
+        model=settings.ocr_model,
+        max_tokens=4096,
+        system=_FIX_LATEX_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    out = "".join(b.text for b in response.content if b.type == "text").strip()
+    fence = re.search(r"```(?:latex)?\s*(.*?)```", out, re.DOTALL)
+    if fence:
+        out = fence.group(1).strip()
+    logger.info(
+        f"fix_latex [{settings.ocr_model}]: in={response.usage.input_tokens}, "
+        f"out={response.usage.output_tokens}, "
+        f"≈{estimate_cost_rub(settings.ocr_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽"
+    )
+    return out or broken_latex

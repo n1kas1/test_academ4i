@@ -88,10 +88,11 @@ def _content_hash(latex: str) -> str:
 PREVIEW_DPI = 300
 
 
-def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
+def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
     """Синхронно: latex → pdflatex → PDF + PNG-превью первой страницы.
 
-    Пишет полный PDF в out_pdf и превью 1-й страницы в out_png. True если успешно.
+    Пишет полный PDF в out_pdf и превью 1-й страницы в out_png.
+    Возвращает (ok, error): error — хвост лога pdflatex при провале (для авто-фикса).
     """
     with tempfile.TemporaryDirectory(prefix="latex_") as tmpdir:
         tmp = Path(tmpdir)
@@ -110,13 +111,13 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
             )
         except subprocess.TimeoutExpired:
             logger.error("pdflatex timeout")
-            return False
+            return False, "pdflatex timeout"
 
         pdf_path = tmp / "doc.pdf"
         if not pdf_path.exists():
-            tail = (res.stdout or "")[-800:]
+            tail = (res.stdout or "")[-1200:]
             logger.error(f"pdflatex failed:\n{tail}")
-            return False
+            return False, tail
 
         out_pdf.parent.mkdir(parents=True, exist_ok=True)
         out_pdf.write_bytes(pdf_path.read_bytes())
@@ -131,19 +132,19 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
             )
         except subprocess.CalledProcessError as e:
             logger.error(f"pdftoppm failed: {e.stderr.decode() if e.stderr else ''}")
-            return False
+            return False, "pdftoppm failed"
         except subprocess.TimeoutExpired:
             logger.error("pdftoppm timeout")
-            return False
+            return False, "pdftoppm timeout"
 
         png_src = tmp / "out.png"
         if not png_src.exists():
             logger.error(f"PNG not produced. Files: {list(tmp.iterdir())}")
-            return False
+            return False, "PNG not produced"
 
         # 3) Обрезаем белое поле превью через PIL.
         out_png.write_bytes(_trim_white(png_src.read_bytes()))
-        return True
+        return True, ""
 
 
 def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
@@ -173,12 +174,12 @@ def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
 async def render_solution(latex_content: str) -> dict:
     """Асинхронный фасад. Кэш по hash контента.
 
-    Возвращает {"pdf": bytes|None, "preview_png": bytes|None}:
+    Возвращает {"pdf": bytes|None, "preview_png": bytes|None, "error": str|None}:
       • pdf         — полное решение (векторное, многостраничное);
-      • preview_png — PNG-превью первой страницы (для инлайн-показа в чате).
-    Оба None, если рендер не удался.
+      • preview_png — PNG-превью первой страницы (для инлайн-показа в чате);
+      • error       — хвост лога pdflatex при провале (для авто-фикса LaTeX), иначе None.
     """
-    empty = {"pdf": None, "preview_png": None}
+    empty = {"pdf": None, "preview_png": None, "error": None}
     if not latex_content or len(latex_content.strip()) < 10:
         logger.warning("LaTeX content empty")
         return empty
@@ -188,16 +189,16 @@ async def render_solution(latex_content: str) -> dict:
     png_path = CACHE_DIR / f"{h}.png"
     if pdf_path.exists() and png_path.exists():
         logger.info(f"render cache HIT: {h}")
-        return {"pdf": pdf_path.read_bytes(), "preview_png": png_path.read_bytes()}
+        return {"pdf": pdf_path.read_bytes(), "preview_png": png_path.read_bytes(), "error": None}
 
     logger.info(f"render START: {h}, {len(latex_content)} chars")
-    ok = await asyncio.to_thread(_compile_sync, latex_content, pdf_path, png_path)
+    ok, err = await asyncio.to_thread(_compile_sync, latex_content, pdf_path, png_path)
     if not ok:
-        return empty
+        return {"pdf": None, "preview_png": None, "error": err}
 
     pdf_bytes = pdf_path.read_bytes()
     png_bytes = png_path.read_bytes()
     logger.info(
         f"render DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB, png={len(png_bytes)/1024:.0f}KB"
     )
-    return {"pdf": pdf_bytes, "preview_png": png_bytes}
+    return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}
