@@ -31,6 +31,7 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+.obsidian/
 
 # Кэш парсера
 .parser_cache/
