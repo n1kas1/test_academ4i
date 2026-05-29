@@ -25,3 +25,8 @@ async def _noop_render(*_a, **_k):
 _stub.render_solution = _noop_render
 _stub.render_verbatim = _noop_render  # бронебойный fallback в pipeline
 sys.modules.setdefault("app.render.latex_to_png", _stub)
+
+# Заглушка plain_pdf (free-mode рендер через ReportLab) — в тестах не нужна реально.
+_plain_stub = types.ModuleType("app.render.plain_pdf")
+_plain_stub.render_plain_pdf = _noop_render
+sys.modules.setdefault("app.render.plain_pdf", _plain_stub)
