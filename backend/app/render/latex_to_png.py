@@ -215,32 +215,52 @@ async def render_solution(latex_content: str) -> dict:
 # делать. Лучше «черновой PDF» чем «иди в Overleaf».
 # ════════════════════════════════════════════════════════════════════════
 
+# ВАЖНО: breaklines/breakanywhere — это фичи fvextra, НЕ базового fancyvrb.
+# Подключаем fvextra (он в texlive-latex-extra → есть в нашем Docker-образе).
+# Опции — минимальный безопасный набор; никаких commandchars (риск конфликта с
+# контентом, который содержит {} или \).
 _VERBATIM_TEMPLATE = r"""\documentclass[10pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T2A]{fontenc}
 \usepackage[russian]{babel}
-\usepackage[paperwidth=16cm,paperheight=22cm,margin=0.7cm,top=0.9cm,bottom=0.9cm]{geometry}
+\usepackage[paperwidth=18cm,paperheight=22cm,margin=0.7cm,top=0.9cm,bottom=0.9cm]{geometry}
 \usepackage{xcolor}
-\usepackage{fancyvrb}
+\usepackage{fvextra}
 \pagenumbering{gobble}
 \definecolor{accent}{HTML}{1d4ed8}
 \begin{document}
 \noindent{\color{accent}\textbf{\large Решение (черновой вид)}}\\[0.3em]
 \small Форматирование не вытянулось — содержимое ниже как есть. Если что-то непонятно — напиши @manag31.\\[0.6em]
-\begin{Verbatim}[breaklines=true,breakanywhere=true,fontsize=\small,xleftmargin=0pt,commandchars=\\\{\}]
+\begin{Verbatim}[breaklines=true,fontsize=\small]
 %CONTENT%
 \end{Verbatim}
 \end{document}
 """
 
+# Ещё более примитивный шаблон на случай если даже fvextra по какой-то причине
+# не отработает: чистый built-in verbatim (есть в любом LaTeX) — длинные строки
+# выйдут за поле, но PDF будет.
+_VERBATIM_PLAIN_TEMPLATE = r"""\documentclass[10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage[paperwidth=22cm,paperheight=30cm,margin=0.7cm]{geometry}
+\pagenumbering{gobble}
+\begin{document}
+\textbf{\large Решение (черновой вид)}\\
+\small Форматирование не вытянулось — содержимое ниже как есть. Напиши @manag31 если что.\\[0.6em]
+\begin{verbatim}
+%CONTENT%
+\end{verbatim}
+\end{document}
+"""
 
-def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
-    """Гарантированный рендер через verbatim. Возвращает (ok, err)."""
-    # Защита: содержимое не должно случайно закрыть наш Verbatim, и не должно
-    # содержать команд (commandchars=\\\{\}) что-то ломающих. Чтобы fancyvrb
-    # с включёнными commandchars не пытался интерпретировать ничего, проще
-    # отключить commandchars — но тогда теряем перенос. Здесь commandchars
-    # на стандартных \\ {} — это маловероятный конфликт.
+
+def _try_compile_template(template: str, latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
+    """Пробует скомпилировать данный шаблон с подставленным контентом.
+
+    Возвращает (ok, err_tail).
+    """
     safe = (
         latex_content
         .replace(r"\end{Verbatim}", r"\end {Verbatim}")
@@ -249,7 +269,7 @@ def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> 
     with tempfile.TemporaryDirectory(prefix="latex_vb_") as tmpdir:
         tmp = Path(tmpdir)
         tex_path = tmp / "doc.tex"
-        full_doc = _VERBATIM_TEMPLATE.replace("%CONTENT%", safe)
+        full_doc = template.replace("%CONTENT%", safe)
         tex_path.write_text(full_doc, encoding="utf-8")
         try:
             res = subprocess.run(
@@ -258,19 +278,12 @@ def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> 
                 capture_output=True, encoding="utf-8", errors="replace", timeout=30,
             )
         except subprocess.TimeoutExpired:
-            logger.error("verbatim pdflatex timeout")
-            return False, "verbatim pdflatex timeout"
-
+            return False, "pdflatex timeout"
         pdf_path = tmp / "doc.pdf"
         if not pdf_path.exists():
-            tail = (res.stdout or "")[-1500:]
-            logger.error(f"verbatim pdflatex failed (rare):\n{tail}")
-            return False, tail
-
+            return False, (res.stdout or "")[-1500:]
         out_pdf.parent.mkdir(parents=True, exist_ok=True)
         out_pdf.write_bytes(pdf_path.read_bytes())
-
-        # PNG-превью: best-effort, не критично — у нас уже есть PDF.
         ppm_prefix = tmp / "out"
         try:
             subprocess.run(
@@ -284,6 +297,22 @@ def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> 
         except Exception as e:
             logger.warning(f"verbatim pdftoppm failed (non-critical): {e}")
         return True, ""
+
+
+def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
+    """Гарантированный рендер через verbatim — сначала fvextra (красиво),
+    затем чистый built-in verbatim. Если и это упадёт, значит pdflatex
+    в принципе не работает.
+    """
+    ok, err = _try_compile_template(_VERBATIM_TEMPLATE, latex_content, out_pdf, out_png)
+    if ok:
+        return True, ""
+    logger.warning(f"verbatim (fvextra) failed: {err[-300:]} — пробую plain verbatim")
+    ok, err = _try_compile_template(_VERBATIM_PLAIN_TEMPLATE, latex_content, out_pdf, out_png)
+    if ok:
+        return True, ""
+    logger.error(f"plain verbatim ТОЖЕ failed (TeX engine down?): {err[-300:]}")
+    return False, err
 
 
 async def render_verbatim(latex_content: str) -> dict:

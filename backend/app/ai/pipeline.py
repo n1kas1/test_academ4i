@@ -129,13 +129,45 @@ def _clean_latex(text: str) -> str:
     return text.strip()
 
 
+# Все варианты math-окружений LaTeX. DeepSeek активно использует \(...\), \[...\]
+# и align*, а не только $...$ — узкий регэксп их пропускал → сломанные кэшы.
+_MATH_REGEXPS = [
+    re.compile(r"(?<!\\)(?<!\$)\$([^\$\n]{1,500}?)\$(?!\$)", re.DOTALL),       # $...$
+    re.compile(r"\$\$(.+?)\$\$", re.DOTALL),                                    # $$...$$
+    re.compile(r"\\\((.+?)\\\)", re.DOTALL),                                    # \(...\)
+    re.compile(r"\\\[(.+?)\\\]", re.DOTALL),                                    # \[...\]
+    re.compile(r"\\begin\{(?:equation\*?|align\*?|gather\*?|multline\*?|displaymath)\}(.+?)\\end\{(?:equation\*?|align\*?|gather\*?|multline\*?|displaymath)\}", re.DOTALL),
+]
+_TEXT_WRAP_RE = re.compile(r"\\(?:text|mathrm|mbox|operatorname|textbf|textit)\{[^{}]*\}")
+_CYR_RE = re.compile(r"[А-ЯЁа-яё]")
+
+
+def _has_cyrillic_in_math(text: str) -> bool:
+    """True если в каком-либо math-окружении есть кириллица БЕЗ \\text{...} обёртки.
+
+    Покрывает $...$, $$...$$, \\(...\\), \\[...\\], align*, gather*, multline*,
+    equation*, displaymath. Такие LaTeX падают на T2A с
+    'Command \\cyrm invalid in math mode' / 'Bad math environment delimiter'.
+    """
+    for rx in _MATH_REGEXPS:
+        for m in rx.finditer(text):
+            body = _TEXT_WRAP_RE.sub("", m.group(1))
+            if _CYR_RE.search(body):
+                return True
+    return False
+
+
 def _is_valid_latex(text: str) -> bool:
-    """Проверка что cached решение — наш текущий LaTeX-формат, а не устаревший HTML."""
+    """Проверка что cached решение — наш текущий LaTeX-формат, не сломан, не HTML."""
     if not text:
         return False
     if any(m in text for m in _LEGACY_MARKERS):
         return False
-    return any(m in text for m in _LATEX_MARKERS)
+    if not any(m in text for m in _LATEX_MARKERS):
+        return False
+    if _has_cyrillic_in_math(text):
+        return False
+    return True
 
 
 async def solve_task_from_photo(
