@@ -144,7 +144,9 @@ async def menu_balance(message: Message):
 
 @router.message(F.text == BTN_HELP)
 async def menu_help(message: Message):
-    await message.answer(MSG_HELP_CREDITS)
+    # Раньше тут всегда отдавался MSG_HELP_CREDITS — с пакетами/тарифами/звёздами.
+    # В free-mode это категорически нельзя.
+    await message.answer(MSG_HELP_FREE if settings.free_mode else MSG_HELP_CREDITS)
 
 
 @router.message(F.text == BTN_BUY_CREDITS)
@@ -506,23 +508,15 @@ async def _send_solution_result(
         pass
 
     if not pdf_bytes and not png_bytes:
-        # Авто-фиксы LaTeX исчерпаны. Не оставляем юзера с голым текстом —
-        # отдаём готовый .tex-файл, чтобы можно было собрать в Overleaf.
-        logger.warning("Render failed — sending .tex as document fallback")
-        tex_payload = (latex_text or "% решение не получилось").encode("utf-8")
-        try:
-            await bot.send_document(
-                chat_id,
-                document=BufferedInputFile(tex_payload, filename="solution.tex"),
-                caption=(
-                    "📄 PDF не получился, но вот LaTeX-исходник.\n\n"
-                    "Открой <b>Overleaf</b> (online, бесплатно) и собери PDF там, "
-                    "либо напиши @manag31."
-                ),
-            )
-        except Exception as e:
-            logger.warning(f".tex fallback send failed: {e}")
-            await bot.send_message(chat_id, MSG_ERROR)
+        # До этой ветки доходим только если даже verbatim-рендер сломался
+        # (значит сама TeX-машина на сервере не работает). Юзеру в чат
+        # бесполезно слать LaTeX-исходник — это его никак не спасёт.
+        logger.error("ALL render tiers failed (verbatim too) — sending error msg")
+        await bot.send_message(
+            chat_id,
+            "😔 Сейчас не получается оформить PDF. Попробуй ещё раз через минуту "
+            "или напиши @manag31.",
+        )
         return
 
     token = secrets.token_urlsafe(8)
