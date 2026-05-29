@@ -3,8 +3,11 @@
 Админы (settings.admin_usernames_set) обходят все лимиты — безлимит решений.
 """
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+# Daily cap считается по московским суткам — бот для москвичей.
+MSK = timezone(timedelta(hours=3))
 
 from loguru import logger
 from sqlalchemy import select, text
@@ -39,7 +42,8 @@ async def check_rate_limit(telegram_id: int) -> bool:
 # === Daily cap (free-mode защита от абьюза, UTC-сутки) ===
 
 def _daily_cap_key(telegram_id: int) -> str:
-    now = datetime.now(timezone.utc)
+    # Ключ по МСК-суткам: для москвичей "новый день" = 00:00 МСК.
+    now = datetime.now(MSK)
     return f"dailycap:{telegram_id}:{now:%Y%m%d}"
 
 
