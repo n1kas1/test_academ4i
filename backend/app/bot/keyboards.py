@@ -66,23 +66,16 @@ def mode_choice_keyboard(token: str) -> InlineKeyboardMarkup:
     ])
 
 
-def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup:
-    """Inline под решением: показать LaTeX + (опц.) перерешать.
+def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup | None:
+    """Inline под решением: только «Перерешать» (LaTeX-кнопка убрана — никому не нужна).
 
-    Оба действия на одном token (данные решения лежат в Redis под sol:{token}).
-    allow_resolve=False — для результата самого «перерешать» (одна бесплатная
-    попытка на решение, чтобы не было бесконечной цепочки).
+    allow_resolve=False (на результате самого «перерешать») → клавиатура не нужна.
     """
-    rows = [[InlineKeyboardButton(
-        text="📋 Показать LaTeX (для копирования)",
-        callback_data=f"latex:{token}",
-    )]]
-    if allow_resolve:
-        rows.append([InlineKeyboardButton(
-            text="🔄 Перерешать",
-            callback_data=f"resolve:{token}",
-        )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    if not allow_resolve:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Перерешать", callback_data=f"resolve:{token}"),
+    ]])
 
 
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:

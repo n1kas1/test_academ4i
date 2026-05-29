@@ -14,18 +14,22 @@
 import asyncio
 import io
 import os
-import subprocess
-import tempfile
-from pathlib import Path
+import textwrap
 
 from loguru import logger
 from reportlab.lib.colors import HexColor
-from reportlab.lib.pagesizes import A5
+from reportlab.lib.pagesizes import portrait
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, XPreformatted
+
+
+# Кастомная страница 16×22см (мобильно-удобный размер, как LaTeX-шаблон).
+_PAGE_W = 16 * cm
+_PAGE_H = 22 * cm
+_PAGESIZE = portrait((_PAGE_W, _PAGE_H))
 
 
 _BODY_FONT = "Body"
@@ -61,14 +65,41 @@ def _escape_xml(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# Жёсткий перенос длинных строк. XPreformatted переносит ТОЛЬКО по пробелам;
+# DeepSeek любит выдавать формулы без пробелов (∫(x²+3)/(x³-x)dx=…) — такие
+# одной "строкой-словом" уезжают за правый край. Бьём их насильно.
+MAX_LINE = 78
+
+
+def _wrap_long_lines(text: str, width: int = MAX_LINE) -> str:
+    out = []
+    for raw in text.splitlines():
+        if len(raw) <= width:
+            out.append(raw)
+            continue
+        stripped = raw.lstrip(" ")
+        indent = " " * (len(raw) - len(stripped))
+        inner = max(20, width - len(indent))
+        # break_long_words=True → рубим по символам, если "слово" длиннее inner.
+        # Лучше уродливый перенос формулы, чем строка за полем.
+        for w in textwrap.wrap(
+            stripped, width=inner,
+            break_long_words=True, break_on_hyphens=False,
+            drop_whitespace=False, replace_whitespace=False,
+        ):
+            out.append(indent + w)
+    return "\n".join(out)
+
+
 def _compile_sync(text: str) -> bytes:
     body_font = _register_fonts()
+    text = _wrap_long_lines(text)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
-        pagesize=A5,
-        leftMargin=1.0 * cm, rightMargin=1.0 * cm,
-        topMargin=1.0 * cm, bottomMargin=1.0 * cm,
+        pagesize=_PAGESIZE,
+        leftMargin=0.8 * cm, rightMargin=0.8 * cm,
+        topMargin=0.9 * cm, bottomMargin=0.9 * cm,
         title="Academ4I solution",
     )
     body_style = ParagraphStyle(
@@ -82,34 +113,16 @@ def _compile_sync(text: str) -> bytes:
         allowOrphans=1,
         allowWidows=1,
     )
-    # XPreformatted: сохраняет \n как переносы строк, при длинных строках сам
-    # переносит по словам (в отличие от Preformatted — тот не переносит).
     flow = [XPreformatted(_escape_xml(text), body_style)]
     doc.build(flow)
     return buf.getvalue()
 
 
-def _make_preview(pdf_bytes: bytes) -> bytes | None:
-    """Первая страница PDF → PNG через pdftoppm (poppler уже в образе)."""
-    try:
-        with tempfile.TemporaryDirectory(prefix="plainpdf_") as td:
-            t = Path(td)
-            pdf_p = t / "in.pdf"
-            pdf_p.write_bytes(pdf_bytes)
-            subprocess.run(
-                ["pdftoppm", "-r", "200", "-png", "-singlefile",
-                 "-f", "1", "-l", "1", str(pdf_p), str(t / "out")],
-                check=True, capture_output=True, timeout=10,
-            )
-            png_p = t / "out.png"
-            return png_p.read_bytes() if png_p.exists() else None
-    except Exception as e:
-        logger.warning(f"plain_pdf preview failed (non-critical): {e}")
-        return None
-
-
 async def render_plain_pdf(text: str) -> dict:
-    """Plain-text → PDF. Возвращает {pdf, preview_png, error}."""
+    """Plain-text → PDF. Возвращает {pdf, preview_png=None, error}.
+
+    PNG-превью не делаем: Telegram сам показывает thumbnail PDF.
+    """
     empty = {"pdf": None, "preview_png": None, "error": None}
     if not text or len(text.strip()) < 5:
         return {**empty, "error": "empty text"}
@@ -118,9 +131,5 @@ async def render_plain_pdf(text: str) -> dict:
     except Exception as e:
         logger.exception(f"plain_pdf compile failed: {e}")
         return {**empty, "error": f"compile failed: {e}"}
-    png_bytes = await asyncio.to_thread(_make_preview, pdf_bytes)
-    logger.info(
-        f"plain_pdf DONE: pdf={len(pdf_bytes)/1024:.0f}KB"
-        + (f", png={len(png_bytes)/1024:.0f}KB" if png_bytes else " (no png)")
-    )
-    return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}
+    logger.info(f"plain_pdf DONE: pdf={len(pdf_bytes)/1024:.0f}KB")
+    return {"pdf": pdf_bytes, "preview_png": None, "error": None}
