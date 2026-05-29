@@ -23,7 +23,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, XPreformatted
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 
 # Кастомная страница 16×22см (мобильно-удобный размер, как LaTeX-шаблон).
@@ -60,15 +60,11 @@ def _register_fonts() -> str:
     return "Courier"
 
 
-def _escape_xml(s: str) -> str:
-    """ReportLab XPreformatted понимает inline-XML — экранируем спецсимволы."""
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# Жёсткий перенос длинных строк. XPreformatted переносит ТОЛЬКО по пробелам;
-# DeepSeek любит выдавать формулы без пробелов (∫(x²+3)/(x³-x)dx=…) — такие
-# одной "строкой-словом" уезжают за правый край. Бьём их насильно.
-MAX_LINE = 78
+# Safety-net hard-wrap: рубим супер-длинные "слова" без пробелов (формулы),
+# чтобы они не уезжали за поле даже если ReportLab их не сможет перенести.
+# Считаем по char count — приблизительно, основной перенос делает Paragraph
+# по реальной пиксельной ширине.
+MAX_LINE = 65
 
 
 def _wrap_long_lines(text: str, width: int = MAX_LINE) -> str:
@@ -80,8 +76,6 @@ def _wrap_long_lines(text: str, width: int = MAX_LINE) -> str:
         stripped = raw.lstrip(" ")
         indent = " " * (len(raw) - len(stripped))
         inner = max(20, width - len(indent))
-        # break_long_words=True → рубим по символам, если "слово" длиннее inner.
-        # Лучше уродливый перенос формулы, чем строка за полем.
         for w in textwrap.wrap(
             stripped, width=inner,
             break_long_words=True, break_on_hyphens=False,
@@ -91,14 +85,23 @@ def _wrap_long_lines(text: str, width: int = MAX_LINE) -> str:
     return "\n".join(out)
 
 
+def _to_paragraph_html(block: str) -> str:
+    """Экранируем XML-спецсимволы и переводим \\n внутри блока в <br/>."""
+    # Сначала экранируем, чтобы у нас не было реального XML в исходнике.
+    esc = block.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Теперь \\n → <br/> (это уже наш разметочный тег, не пользовательский ввод).
+    return esc.replace("\n", "<br/>")
+
+
 def _compile_sync(text: str) -> bytes:
     body_font = _register_fonts()
     text = _wrap_long_lines(text)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
         pagesize=_PAGESIZE,
-        leftMargin=0.8 * cm, rightMargin=0.8 * cm,
+        leftMargin=0.9 * cm, rightMargin=0.9 * cm,
         topMargin=0.9 * cm, bottomMargin=0.9 * cm,
         title="Academ4I solution",
     )
@@ -108,12 +111,18 @@ def _compile_sync(text: str) -> bytes:
         fontSize=10.5,
         leading=14.5,
         textColor=HexColor("#111827"),
-        spaceAfter=0,
-        wordWrap="LTR",
+        wordWrap="CJK",  # CJK режим переносит ВЕЗДЕ при необходимости (не только по пробелам).
         allowOrphans=1,
         allowWidows=1,
     )
-    flow = [XPreformatted(_escape_xml(text), body_style)]
+    # Делим текст на абзацы по пустой строке. Каждый абзац — отдельный Paragraph
+    # (Paragraph переносит по реальной ширине шрифта, в отличие от XPreformatted).
+    blocks = [b for b in text.split("\n\n") if b.strip()]
+    flow = []
+    for i, block in enumerate(blocks):
+        flow.append(Paragraph(_to_paragraph_html(block), body_style))
+        if i < len(blocks) - 1:
+            flow.append(Spacer(1, 6))
     doc.build(flow)
     return buf.getvalue()
 

@@ -519,23 +519,13 @@ async def _send_solution_result(
         )
         return
 
-    # Сохраняем данные для кнопки «Перерешать» — только если она есть.
-    can_resolve = bool(allow_resolve and image_ref and image_ref.get("file_id"))
-    kb = None
-    if can_resolve:
-        token = secrets.token_urlsafe(8)
-        payload = {"latex": latex_text, **image_ref}
-        await get_redis().set(f"sol:{token}", json.dumps(payload), ex=SOLUTION_TTL_SECONDS)
-        kb = solution_keyboard(token, allow_resolve=True)
-
-    # Одно сообщение: PDF-документ с подписью + (опц.) кнопкой «Перерешать».
-    # Telegram сам показывает первую страницу PDF как превью.
+    # Одно сообщение: PDF с подписью. Никаких inline-кнопок —
+    # юзеру нужно решение, а не действия над ним.
     if pdf_bytes:
         await bot.send_document(
             chat_id,
             document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
             caption=caption,
-            reply_markup=kb,
         )
     elif png_bytes:
         # Очень редкий fallback: PDF не получился, есть только превью PNG.
@@ -543,7 +533,6 @@ async def _send_solution_result(
             chat_id,
             photo=BufferedInputFile(png_bytes, filename="solution.png"),
             caption=caption,
-            reply_markup=kb,
         )
 
 
