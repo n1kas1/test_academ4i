@@ -67,15 +67,12 @@ def mode_choice_keyboard(token: str) -> InlineKeyboardMarkup:
 
 
 def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup | None:
-    """Inline под решением: только «Перерешать» (LaTeX-кнопка убрана — никому не нужна).
+    """Под решением никаких кнопок: ни LaTeX, ни «Перерешать».
 
-    allow_resolve=False (на результате самого «перерешать») → клавиатура не нужна.
+    Сигнатура и сам файл оставлены для обратной совместимости импортов; функция
+    всегда возвращает None.
     """
-    if not allow_resolve:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Перерешать", callback_data=f"resolve:{token}"),
-    ]])
+    return None
 
 
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:
