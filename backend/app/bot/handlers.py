@@ -326,15 +326,22 @@ async def _run_solve(
 @router.callback_query(F.data.startswith("mode:"))
 async def handle_mode(callback: CallbackQuery, bot: Bot):
     """Юзер выбрал режим решения — проверяем баланс и решаем."""
+    # Ack callback СРАЗУ: любая задержка ~>10c → TelegramBadRequest "query is too old"
+    # и /webhook отдаёт 500 → TG ретраит → лавина 500. Алерты доставляем через
+    # message.answer() ниже.
+    try:
+        await callback.answer()
+    except Exception as e:
+        logger.warning(f"callback.answer (mode) skipped: {e}")
+
     parts = callback.data.split(":")  # ["mode", token, "standard"|"premium"]
     if len(parts) != 3:
-        await callback.answer()
         return
     token, mode = parts[1], parts[2]
 
     raw = await get_redis().get(f"pend:{token}")
     if not raw:
-        await callback.answer("Выбор устарел (хранится 1 час). Пришли фото снова.", show_alert=True)
+        await callback.message.answer("Выбор устарел (хранится 1 час). Пришли фото снова.")
         return
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
@@ -344,7 +351,6 @@ async def handle_mode(callback: CallbackQuery, bot: Bot):
     cost = _mode_cost(mode)
     status = await get_credit_status(user.id, username=user.username)
     if not status.can_afford(cost):
-        await callback.answer()
         log_event(user.id, "paywall_shown")
         await callback.message.answer(
             msg_insufficient_credits(status.credits, cost),
@@ -353,10 +359,9 @@ async def handle_mode(callback: CallbackQuery, bot: Bot):
         return
 
     if not await check_rate_limit(user.id):
-        await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
+        await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
         return
 
-    await callback.answer()
     await get_redis().delete(f"pend:{token}")
 
     processing_msg = callback.message
@@ -374,15 +379,20 @@ async def handle_mode(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("pick:"))
 async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     """Юзер выбрал, какую из нескольких задач решить (режим уже выбран ранее)."""
+    # Ack callback СРАЗУ — см. handle_mode выше.
+    try:
+        await callback.answer()
+    except Exception as e:
+        logger.warning(f"callback.answer (pick) skipped: {e}")
+
     parts = callback.data.split(":")  # ["pick", token, idx]
     if len(parts) != 3:
-        await callback.answer()
         return
     token, idx_str = parts[1], parts[2]
 
     raw = await get_redis().get(f"taskpick:{token}")
     if not raw:
-        await callback.answer("Выбор устарел (хранится 1 час). Пришли фото снова.", show_alert=True)
+        await callback.message.answer("Выбор устарел (хранится 1 час). Пришли фото снова.")
         return
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
@@ -397,7 +407,7 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     except ValueError:
         idx = 0
     if not (0 <= idx < len(task_ids)) or not file_id:
-        await callback.answer("Что-то пошло не так, пришли фото снова.", show_alert=True)
+        await callback.message.answer("Что-то пошло не так, пришли фото снова.")
         return
     chosen = task_ids[idx]
 
@@ -405,7 +415,6 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     cost = _mode_cost(mode)
     status = await get_credit_status(user.id, username=user.username)
     if not status.can_afford(cost):
-        await callback.answer()
         log_event(user.id, "paywall_shown")
         await callback.message.answer(
             msg_insufficient_credits(status.credits, cost),
@@ -413,10 +422,9 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
         )
         return
     if not await check_rate_limit(user.id):
-        await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
+        await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
         return
 
-    await callback.answer()
     await get_redis().delete(f"taskpick:{token}")
 
     processing_msg = callback.message
