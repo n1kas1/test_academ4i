@@ -37,26 +37,78 @@ from loguru import logger
 
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
-from app.ai.deepseek import solve_with_deepseek
+from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek
+from app.render.plain_pdf import render_plain_pdf
+from app.config import settings as _settings
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 from app.render.latex_to_png import render_solution, render_verbatim
 
 
-async def _render_with_autofix(latex: str) -> tuple[dict, str]:
-    """Рендер с двух-tier авто-фиксом: Haiku → Sonnet. Цель — гарантировать PDF.
+_PLAIN_MARKERS = ("Задача:", "Решение:", "Ответ:")
 
-    Tier 0: рендер как есть.
-    Tier 1: Haiku-фикс по логу ошибки → re-render.
-    Tier 2: Sonnet-фикс (стоит дороже, но надёжнее) → re-render.
-    Если все провалились — возвращаем последний рендер (caller отправит .tex-файлом).
+
+def _is_plain_format(text: str) -> bool:
+    """Контент в plain-формате (Unicode math, не LaTeX)?
+
+    True если нет ни одного LaTeX-маркера (\\hd, \\frac, $$, \\(, \\[, \\begin{)
+    и есть хотя бы один plain-маркер ("Задача:" / "Решение:" / "Ответ:").
     """
+    if any(m in text for m in (r"\hd{", r"\ans{", "$$", r"\(", r"\[", r"\begin{", r"\frac")):
+        return False
+    return any(m in text for m in _PLAIN_MARKERS)
+
+
+async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[dict, str]:
+    """Гарантированный рендер PDF с авто-фиксами.
+
+    free_mode (дешёвый путь):
+      0) если контент уже plain — сразу ReportLab PDF.
+      1) основной LaTeX-рендер (pdflatex).
+      2) DeepSeek-fix LaTeX по логу ошибки → re-render.
+      3) DeepSeek-plain (тот же DeepSeek, другой системный промпт) → ReportLab PDF.
+    paid_mode (дорогой путь, использовался ранее):
+      Haiku-fix → Sonnet-fix → verbatim.
+    """
+    # Free-mode короткий путь: уже plain → ReportLab.
+    if _settings.free_mode and _is_plain_format(latex):
+        rendered = await render_plain_pdf(latex)
+        return rendered, latex
+
+    # Tier 1 — основной LaTeX-рендер.
     rendered = await render_solution(latex)
     if rendered["pdf"] or not rendered.get("error"):
         return rendered, latex
 
-    # Tier 1 — Haiku
-    logger.warning("render failed — авто-фикс через Haiku")
+    # ── FREE-MODE: DeepSeek-fix → DeepSeek-plain ──
+    if _settings.free_mode:
+        logger.warning("render failed — DeepSeek-fix LaTeX (free-mode)")
+        try:
+            fixed = await fix_latex_with_deepseek(latex, rendered["error"])
+            if fixed and fixed.strip() != latex.strip():
+                re_rend = await render_solution(fixed)
+                if re_rend["pdf"]:
+                    logger.info("DeepSeek-fix succeeded → PDF собран")
+                    return re_rend, fixed
+        except Exception as e:
+            logger.warning(f"fix_latex_with_deepseek failed: {e}")
+
+        # Tier 3 — plain-формат через ReportLab. PDF будет всегда.
+        if condition_text:
+            logger.warning("LaTeX-путь исчерпан — переключаемся на plain-формат")
+            try:
+                plain = await solve_with_deepseek_plain(condition_text)
+                if plain:
+                    rendered_plain = await render_plain_pdf(plain)
+                    if rendered_plain.get("pdf"):
+                        logger.info("plain-PDF собран ✓")
+                        return rendered_plain, plain
+            except Exception as e:
+                logger.warning(f"plain-pipeline failed: {e}")
+        return rendered, latex
+
+    # ── PAID-MODE: legacy Haiku/Sonnet/verbatim chain ──
+    logger.warning("render failed — Haiku-fix (paid-mode)")
     try:
         fixed = await fix_latex(latex, rendered["error"])
     except Exception as e:
@@ -65,12 +117,10 @@ async def _render_with_autofix(latex: str) -> tuple[dict, str]:
     if fixed and fixed.strip() != latex.strip():
         rerendered = await render_solution(fixed)
         if rerendered["pdf"]:
-            logger.info("Haiku-фикс удался → PDF собран")
             return rerendered, fixed
-        latex, rendered = fixed, rerendered  # перейдём ко 2-му tier с обновлённой ошибкой
+        latex, rendered = fixed, rerendered
 
-    # Tier 2 — Sonnet (более тщательный фикс, редко зовётся)
-    logger.warning("Haiku не вытянул — пробую Sonnet-фикс")
+    logger.warning("Haiku не вытянул — Sonnet-fix (paid)")
     try:
         fixed2 = await fix_latex_strong(latex, rendered.get("error") or "")
     except Exception as e:
@@ -79,19 +129,16 @@ async def _render_with_autofix(latex: str) -> tuple[dict, str]:
     if fixed2 and fixed2.strip() != latex.strip():
         re2 = await render_solution(fixed2)
         if re2["pdf"]:
-            logger.info("Sonnet-фикс удался → PDF собран")
             return re2, fixed2
         rendered, latex = re2, fixed2
 
-    # Tier 3 — бронебойный verbatim. PDF будет ВСЕГДА (черновой вид, но PDF).
-    logger.warning("Авто-фиксы исчерпаны — финальный verbatim-рендер")
+    logger.warning("Sonnet не вытянул — verbatim (paid)")
     try:
         vb = await render_verbatim(latex)
         if vb.get("pdf"):
-            logger.info("verbatim-рендер удался → PDF (черновой) собран")
             return vb, latex
     except Exception as e:
-        logger.error(f"verbatim render failed (rare!): {e}")
+        logger.error(f"verbatim render failed: {e}")
     return rendered, latex
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
@@ -158,11 +205,15 @@ def _has_cyrillic_in_math(text: str) -> bool:
 
 
 def _is_valid_latex(text: str) -> bool:
-    """Проверка что cached решение — наш текущий LaTeX-формат, не сломан, не HTML."""
+    """Проверка валидности cached решения. Принимает либо LaTeX, либо plain-формат."""
     if not text:
         return False
     if any(m in text for m in _LEGACY_MARKERS):
         return False
+    # Plain-формат (Unicode math) — принимаем сразу, если есть маркеры структуры.
+    if any(m in text for m in _PLAIN_MARKERS):
+        return True
+    # LaTeX — должны быть маркеры и не должно быть кириллицы внутри math.
     if not any(m in text for m in _LATEX_MARKERS):
         return False
     if _has_cyrillic_in_math(text):
@@ -229,7 +280,8 @@ async def solve_task_from_photo(
         )
         latex_clean = _clean_latex(latex_raw)
         await _status(on_status, "🖼 Оформляю решение…")
-        rendered, latex_clean = await _render_with_autofix(latex_clean)
+        # condition_text=""— на этой ветке OCR провалился, plain-fallback не сможет.
+        rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text="")
         return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
     # 4) Классификация темы (для фильтрации retrieval)
@@ -272,7 +324,7 @@ async def solve_task_from_photo(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            rendered, cached_latex = await _render_with_autofix(cached_latex)
+            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
         else:
             logger.info(
@@ -319,7 +371,7 @@ async def solve_task_from_photo(
 
     # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого) + авто-фикс при ошибке
     await _status(on_status, "🖼 Оформляю решение…")
-    rendered, latex_clean = await _render_with_autofix(latex_clean)
+    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text)
 
     logger.info(
         f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, "
@@ -372,7 +424,7 @@ async def solve_task_from_text(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            rendered, cached_latex = await _render_with_autofix(cached_latex)
+            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
@@ -394,7 +446,7 @@ async def solve_task_from_text(
         logger.warning(f"save_solution failed (non-fatal): {e}")
 
     await _status(on_status, "🖼 Оформляю решение…")
-    rendered, latex_clean = await _render_with_autofix(latex_clean)
+    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text)
 
     logger.info(
         f"Pipeline (text) done for user {user_id}: latex={len(latex_clean)} chars, "

@@ -7,6 +7,7 @@
 Транспорт идентичен адаптеру из scripts/eval_models.py.
 """
 import html
+import re
 
 from openai import AsyncOpenAI
 from loguru import logger
@@ -65,7 +66,7 @@ async def solve_with_deepseek(
     rag_context: str = "",
     user_hint: str = "",
 ) -> str:
-    """Решить задачу текстом через DeepSeek v3.1. Возвращает LaTeX-решение."""
+    """Решить задачу текстом через DeepSeek v3.1 (LaTeX-формат, paid-mode)."""
     client = get_client()
     user_text = _build_user_text(condition_text, rag_context, user_hint)
 
@@ -84,6 +85,146 @@ async def solve_with_deepseek(
     out_tok = getattr(usage, "completion_tokens", 0)
     logger.info(
         f"DeepSeek solved [{settings.deepseek_model}]: "
+        f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
+    )
+    return text.strip()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Plain-text режим (free-mode): обычный текст + Unicode-математика.
+# Рендерится через ReportLab напрямую в PDF — никаких pdflatex-сюрпризов.
+# ════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT_PLAIN = """Ты — преподаватель технического вуза в РФ. Решаешь задачи по математике (матан, линал, алгебра, теорвер, дискретка) и физике (механика, электродинамика, термодинамика, оптика, квантовая, СТО) для студентов 1-2 курса.
+
+ВЫВОДИ СТРОГО ОБЫЧНЫЙ ТЕКСТ. КАТЕГОРИЧЕСКИ НИКАКОГО LaTeX:
+- НЕТ команд: \\frac, \\int, \\sqrt, \\sum, \\hd, \\ans, \\textbf, \\begin{...}, \\end{...}, \\(, \\), \\[, \\].
+- НЕТ долларов: $...$, $$...$$.
+- НЕТ Markdown (**, ##, ```), эмодзи, HTML.
+- Используй Unicode-символы для математики:
+  ∫ ∑ ∏ √ ∂ ∇ ∞ π α β γ δ ε ζ η θ λ μ ν ξ σ τ φ χ ψ ω Δ Σ Π Φ Ω
+  → ⇒ ⇔ ↔ ≤ ≥ ≠ ≈ ≡ ± ∓ · × ÷ ⋅ ∈ ∉ ⊂ ⊆ ⊃ ⊇ ∪ ∩ ∅ ∀ ∃ … ° ′ ″
+- Степени Unicode: x², x³, x⁴, ⁻¹. Для буквенных — x^n, e^t.
+- Индексы Unicode: x₀, x₁, x₂, aₙ, aᵢ. Для составных — a_{n+1}.
+- Дроби — в одну строку: (a + b)/(c − d) или a/b. НЕ \\frac.
+
+ФОРМАТ ОТВЕТА — СТРОГО ВОТ ТАК:
+
+Задача: <одна короткая строка>
+
+Решение:
+
+1) <заголовок шага одной строкой>
+
+   <1-3 строки пояснения и формул, отступ 3 пробела>
+
+2) <заголовок>
+
+   <тело>
+
+… (2-5 шагов, не больше)
+
+Ответ: <итог одной короткой строкой>
+
+ПРАВИЛА:
+- Максимум 5 шагов. Лучше 2-3 шага по делу, чем 7 «для красоты».
+- Каждая строка — не длиннее ~80 символов (читается на телефоне).
+- Никакой воды. Никаких «таким образом, мы показали…» — сразу формулу.
+- Каждый шаг отделяй пустой строкой. Тело шага — с отступом 3 пробела.
+- В формулах русские слова можно писать обычно (это plain-text)."""
+
+
+_USER_PROMPT_PLAIN_PREFIX = (
+    "Условие задачи (распознано с фото или присланного текста):\n"
+)
+
+
+def _build_user_text_plain(condition_text: str, rag_context: str, user_hint: str) -> str:
+    """User-сообщение в plain-режиме (RAG-контекст оставляем как референс)."""
+    parts = [_USER_PROMPT_PLAIN_PREFIX + condition_text]
+    if user_hint:
+        parts.append(f"\nКонтекст от студента: {user_hint}")
+    if rag_context:
+        # RAG-блок оставляем как есть (содержит LaTeX из учебников) — модели как
+        # референс метода/идеи, не для копирования. В системе указано «выводи
+        # plain», поэтому она не унесёт LaTeX в ответ.
+        parts.append(
+            "\n--- ПОХОЖИЕ ЗАДАЧИ ИЗ УЧЕБНИКОВ (как референс метода) ---\n"
+            + rag_context
+            + "\n--- КОНЕЦ ---\n\nРеши именно эту задачу в plain-формате."
+        )
+    return "\n".join(parts)
+
+
+# DeepSeek-фикс невалидного LaTeX (free-mode tier 2, дёшево).
+_DS_FIX_SYSTEM = """Ты чинишь LaTeX-фрагмент решения задачи, который НЕ скомпилировался pdflatex.
+Получаешь сообщение об ошибке и сам фрагмент. Исправь ТОЛЬКО синтаксис, НЕ меняя смысла и не сокращая текст.
+
+Типовые проблемы и фиксы:
+- кириллица внутри $...$/\\(...\\)/\\[...\\]/align* — оборачивай в \\text{...};
+- замени \\(...\\) → $...$, \\[...\\] → $$...$$ (наш шаблон любит доллары);
+- баланс {}, $, \\left … \\right, открыт/закрыт align*/cases/pmatrix;
+- мат-команды (\\frac, \\int, \\sum, \\mathscr, \\cdot, \\cup) — только ВНУТРИ мат-режима;
+- не используй \\section, \\chapter, \\part — у нас другой шаблон;
+- эмодзи — убрать (T2A их не знает).
+
+Команды \\hd{...} и \\ans{...} оставь как есть. Верни ТОЛЬКО исправленный LaTeX —
+без markdown-обёрток ```, без объяснений."""
+
+
+async def fix_latex_with_deepseek(broken_latex: str, error_log: str) -> str:
+    """Дёшево починить LaTeX через DeepSeek (free-mode tier 2)."""
+    client = get_client()
+    user_msg = (
+        f"Ошибка pdflatex:\n{(error_log or '')[-1500:]}\n\n"
+        f"LaTeX-фрагмент (почини и верни целиком):\n{broken_latex}"
+    )
+    response = await client.chat.completions.create(
+        model=settings.deepseek_model,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": _DS_FIX_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    out = (response.choices[0].message.content or "").strip()
+    fence = re.search(r"```(?:latex)?\s*(.*?)```", out, re.DOTALL)
+    if fence:
+        out = fence.group(1).strip()
+    u = response.usage
+    in_tok = getattr(u, "prompt_tokens", 0)
+    out_tok = getattr(u, "completion_tokens", 0)
+    logger.info(
+        f"DeepSeek fix_latex [{settings.deepseek_model}]: "
+        f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
+    )
+    return out or broken_latex
+
+
+async def solve_with_deepseek_plain(
+    condition_text: str,
+    rag_context: str = "",
+    user_hint: str = "",
+) -> str:
+    """Решить задачу в plain-text формате (Unicode math, без LaTeX)."""
+    client = get_client()
+    user_text = _build_user_text_plain(condition_text, rag_context, user_hint)
+
+    response = await client.chat.completions.create(
+        model=settings.deepseek_model,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_PLAIN},
+            {"role": "user", "content": user_text},
+        ],
+    )
+
+    text = response.choices[0].message.content or ""
+    usage = response.usage
+    in_tok = getattr(usage, "prompt_tokens", 0)
+    out_tok = getattr(usage, "completion_tokens", 0)
+    logger.info(
+        f"DeepSeek plain-solved [{settings.deepseek_model}]: "
         f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
     )
     return text.strip()

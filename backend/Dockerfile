@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-lang-cyrillic \
     texlive-science \
     texlive-extra-utils \
+    # DejaVu TTF — для ReportLab plain-PDF (Cyrillic + Unicode math).
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
