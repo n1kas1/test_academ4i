@@ -107,8 +107,11 @@ async def test_get_status_user(monkeypatch):
 
 # ─────────────────────── handlers helpers ───────────────────────
 
-def test_handler_mode_cost_and_caption():
+def test_handler_mode_cost_and_caption(monkeypatch):
     from app.bot import handlers as H
+    from app.config import settings
+    # Тест credit-mode caption: явно выключаем free_mode на время теста.
+    monkeypatch.setattr(settings, "free_mode", False)
     assert H._mode_cost("standard") == 1
     assert H._mode_cost("premium") == 10
     assert H._mode_label("premium") == "💎 Премиум"
@@ -118,6 +121,23 @@ def test_handler_mode_cost_and_caption():
         credits = 20
     cap = H._caption(_S(), "premium", 10)
     assert "Премиум" in cap and "10" in cap
+
+
+def test_handler_caption_free_mode(monkeypatch):
+    """Free-mode caption — без режима/стоимости, просто «бесплатно»."""
+    from app.bot import handlers as H
+    from app.config import settings
+    monkeypatch.setattr(settings, "free_mode", True)
+
+    class _S:
+        is_admin = False
+        credits = 0
+    cap = H._caption(_S(), "standard", 0)
+    assert "бесплатно" in cap.lower()
+    class _Adm:
+        is_admin = True
+        credits = 0
+    assert "админ" in H._caption(_Adm(), "standard", 0).lower()
 
 
 # ─────────────────────── pipeline: роутинг режима ───────────────────────

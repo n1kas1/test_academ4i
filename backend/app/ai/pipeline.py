@@ -269,6 +269,81 @@ async def solve_task_from_photo(
     return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
 
+async def solve_task_from_text(
+    condition_text: str,
+    user_id: int,
+    user_hint: str = "",
+    on_status: StatusCb = None,
+    skip_cache: bool = False,
+) -> dict:
+    """Решить задачу по ТЕКСТУ условия (без фото). Используется в free-mode и для
+    text-input. Всегда DeepSeek (standard-mode), всегда с кэшем.
+
+    Возвращает:
+      • {"empty_input": True} если текст пустой/короткий
+      • {"latex": "...", "png": ..., "pdf": ...} в успехе
+    """
+    logger.info(f"Pipeline (text) start for user {user_id}, len={len(condition_text)}")
+
+    if not condition_text or len(condition_text.strip()) < 5:
+        return {"empty_input": True}
+
+    topic = classify_topic(condition_text)
+    logger.info(f"Topic: {topic} | text: {condition_text[:120]}…")
+
+    await _status(on_status, "🔎 Ищу похожие задачи…")
+    embedding = await embed_text(condition_text)
+    similar_for_rag = await find_similar_solutions(
+        embedding, topic=topic, top_k=RAG_TOP_K,
+        min_similarity=RAG_MIN_SIMILARITY, only_generated=False,
+    )
+
+    use_cache = not skip_cache
+    cache_candidates = await find_similar_solutions(
+        embedding, topic=topic, top_k=1,
+        min_similarity=CACHE_HIT_THRESHOLD, only_generated=True,
+    ) if use_cache else []
+    if cache_candidates:
+        hit = cache_candidates[0]
+        cached_latex = _clean_latex(hit["solution_markdown"])
+        if _is_valid_latex(cached_latex):
+            logger.info(f"💎 CACHE HIT (text): sim={hit['cosine_sim']:.3f}")
+            try:
+                await increment_usage(hit["id"])
+            except Exception as e:
+                logger.warning(f"increment_usage failed: {e}")
+            await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
+            rendered, cached_latex = await _render_with_autofix(cached_latex)
+            return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
+
+    rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
+    await _status(on_status, "🧠 Решаю…")
+    solution_raw = await solve_with_deepseek(
+        condition_text=condition_text,
+        rag_context=rag_context,
+        user_hint=user_hint,
+    )
+    latex_clean = _clean_latex(solution_raw)
+
+    try:
+        await save_solution(
+            task_text=condition_text, task_latex=None, embedding=embedding,
+            topic=topic, solution_markdown=latex_clean,
+            source="generated", generated_for_user=user_id,
+        )
+    except Exception as e:
+        logger.warning(f"save_solution failed (non-fatal): {e}")
+
+    await _status(on_status, "🖼 Оформляю решение…")
+    rendered, latex_clean = await _render_with_autofix(latex_clean)
+
+    logger.info(
+        f"Pipeline (text) done for user {user_id}: latex={len(latex_clean)} chars, "
+        f"pdf={'OK' if rendered['pdf'] else 'FAIL'}"
+    )
+    return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
+
+
 def is_complex_task(task_text: str) -> bool:
     """Эвристика: задача требует extended thinking?
 

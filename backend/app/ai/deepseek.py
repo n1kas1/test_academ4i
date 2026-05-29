@@ -21,7 +21,9 @@ _client: AsyncOpenAI | None = None
 # ПЛЕЙСХОЛДЕР. Уточнить по дашборду ProxyAPI; факт виден в логах списания.
 _RUB_PER_MTOK = (30.0, 120.0)
 
-MAX_TOKENS = 4096
+# Output-лимит. На free-mode подняли с 4096 — DeepSeek дешёвый, можно дать
+# длинные пошаговые решения без обрезов. Input не лимитируем (контекст 128К).
+MAX_TOKENS = 8192
 
 
 def get_client() -> AsyncOpenAI:
