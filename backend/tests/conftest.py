@@ -23,4 +23,5 @@ async def _noop_render(*_a, **_k):
 
 
 _stub.render_solution = _noop_render
+_stub.render_verbatim = _noop_render  # бронебойный fallback в pipeline
 sys.modules.setdefault("app.render.latex_to_png", _stub)

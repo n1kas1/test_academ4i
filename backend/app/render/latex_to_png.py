@@ -202,3 +202,112 @@ async def render_solution(latex_content: str) -> dict:
         f"render DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB, png={len(png_bytes)/1024:.0f}KB"
     )
     return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Бронебойный fallback: `Verbatim`-обёртка.
+#
+# Когда основной рендер не вытянул даже после Sonnet-фикса, заворачиваем сам
+# LaTeX-фрагмент в `\begin{Verbatim}…\end{Verbatim}` (пакет fancyvrb, идёт с
+# texlive-latex-recommended). Этот шаблон компилируется ВСЕГДА — verbatim
+# не интерпретирует команды, а fancyvrb разрывает длинные строки. На выходе —
+# PDF с читаемым «черновиком решения», а не .tex-файл, который юзеру нечего
+# делать. Лучше «черновой PDF» чем «иди в Overleaf».
+# ════════════════════════════════════════════════════════════════════════
+
+_VERBATIM_TEMPLATE = r"""\documentclass[10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage[paperwidth=16cm,paperheight=22cm,margin=0.7cm,top=0.9cm,bottom=0.9cm]{geometry}
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+\pagenumbering{gobble}
+\definecolor{accent}{HTML}{1d4ed8}
+\begin{document}
+\noindent{\color{accent}\textbf{\large Решение (черновой вид)}}\\[0.3em]
+\small Форматирование не вытянулось — содержимое ниже как есть. Если что-то непонятно — напиши @manag31.\\[0.6em]
+\begin{Verbatim}[breaklines=true,breakanywhere=true,fontsize=\small,xleftmargin=0pt,commandchars=\\\{\}]
+%CONTENT%
+\end{Verbatim}
+\end{document}
+"""
+
+
+def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
+    """Гарантированный рендер через verbatim. Возвращает (ok, err)."""
+    # Защита: содержимое не должно случайно закрыть наш Verbatim, и не должно
+    # содержать команд (commandchars=\\\{\}) что-то ломающих. Чтобы fancyvrb
+    # с включёнными commandchars не пытался интерпретировать ничего, проще
+    # отключить commandchars — но тогда теряем перенос. Здесь commandchars
+    # на стандартных \\ {} — это маловероятный конфликт.
+    safe = (
+        latex_content
+        .replace(r"\end{Verbatim}", r"\end {Verbatim}")
+        .replace(r"\end{verbatim}", r"\end {verbatim}")
+    )
+    with tempfile.TemporaryDirectory(prefix="latex_vb_") as tmpdir:
+        tmp = Path(tmpdir)
+        tex_path = tmp / "doc.tex"
+        full_doc = _VERBATIM_TEMPLATE.replace("%CONTENT%", safe)
+        tex_path.write_text(full_doc, encoding="utf-8")
+        try:
+            res = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                 "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("verbatim pdflatex timeout")
+            return False, "verbatim pdflatex timeout"
+
+        pdf_path = tmp / "doc.pdf"
+        if not pdf_path.exists():
+            tail = (res.stdout or "")[-1500:]
+            logger.error(f"verbatim pdflatex failed (rare):\n{tail}")
+            return False, tail
+
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(pdf_path.read_bytes())
+
+        # PNG-превью: best-effort, не критично — у нас уже есть PDF.
+        ppm_prefix = tmp / "out"
+        try:
+            subprocess.run(
+                ["pdftoppm", "-r", str(PREVIEW_DPI), "-png", "-singlefile",
+                 str(pdf_path), str(ppm_prefix)],
+                capture_output=True, check=True, timeout=20,
+            )
+            png_src = tmp / "out.png"
+            if png_src.exists():
+                out_png.write_bytes(_trim_white(png_src.read_bytes()))
+        except Exception as e:
+            logger.warning(f"verbatim pdftoppm failed (non-critical): {e}")
+        return True, ""
+
+
+async def render_verbatim(latex_content: str) -> dict:
+    """Бронебойный fallback. Возвращает {pdf, preview_png, error}."""
+    empty = {"pdf": None, "preview_png": None, "error": None}
+    if not latex_content or len(latex_content.strip()) < 5:
+        return empty
+
+    h = "vb_" + _content_hash(latex_content)
+    pdf_path = CACHE_DIR / f"{h}.pdf"
+    png_path = CACHE_DIR / f"{h}.png"
+    if pdf_path.exists():
+        png = png_path.read_bytes() if png_path.exists() else None
+        return {"pdf": pdf_path.read_bytes(), "preview_png": png, "error": None}
+
+    logger.info(f"render_verbatim START: {h}, {len(latex_content)} chars")
+    ok, err = await asyncio.to_thread(_compile_verbatim_sync, latex_content, pdf_path, png_path)
+    if not ok:
+        return {"pdf": None, "preview_png": None, "error": err}
+
+    pdf_bytes = pdf_path.read_bytes()
+    png_bytes = png_path.read_bytes() if png_path.exists() else None
+    logger.info(
+        f"render_verbatim DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB"
+        + (f", png={len(png_bytes)/1024:.0f}KB" if png_bytes else " (no png)")
+    )
+    return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}

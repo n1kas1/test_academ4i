@@ -40,7 +40,7 @@ from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_
 from app.ai.deepseek import solve_with_deepseek
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
-from app.render.latex_to_png import render_solution
+from app.render.latex_to_png import render_solution, render_verbatim
 
 
 async def _render_with_autofix(latex: str) -> tuple[dict, str]:
@@ -83,7 +83,15 @@ async def _render_with_autofix(latex: str) -> tuple[dict, str]:
             return re2, fixed2
         rendered, latex = re2, fixed2
 
-    logger.warning("Все авто-фиксы исчерпаны — отдадим LaTeX в .tex-файле")
+    # Tier 3 — бронебойный verbatim. PDF будет ВСЕГДА (черновой вид, но PDF).
+    logger.warning("Авто-фиксы исчерпаны — финальный verbatim-рендер")
+    try:
+        vb = await render_verbatim(latex)
+        if vb.get("pdf"):
+            logger.info("verbatim-рендер удался → PDF (черновой) собран")
+            return vb, latex
+    except Exception as e:
+        logger.error(f"verbatim render failed (rare!): {e}")
     return rendered, latex
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
