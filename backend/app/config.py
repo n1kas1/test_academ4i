@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     premium_cost: int = 10      # Sonnet 4.6 + extended thinking (vision)
     trial_credits: int = 5      # начисляется новому юзеру при первом /start
 
+    # === Free-mode (временная промо-модель: всё бесплатно, только DeepSeek) ===
+    # Включи `free_mode=True` чтобы выключить весь paywall: фото/текст идут сразу
+    # в DeepSeek, без выбора режима, без списания кредитов, без покупок в меню.
+    # `free_mode=False` → credit-pricing активен (выбор режима, списания, пакеты).
+    # Daily cap per user (Redis-based, UTC-сутки) — защита от абьюза без paywall.
+    free_mode: bool = True
+    free_daily_cap: int = 30
+    # Принимаем только математику/физику. Haiku-гейт классифицирует входящий текст
+    # (для фото — после OCR). Используем settings.ocr_model (Haiku).
+    topic_gate_enabled: bool = True
+
     # === Админы (безлимит) — usernames через запятую без @ ===
     admin_usernames: str = "manag31"
 

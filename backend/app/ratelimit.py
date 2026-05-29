@@ -3,6 +3,7 @@
 Админы (settings.admin_usernames_set) обходят все лимиты — безлимит решений.
 """
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
@@ -33,6 +34,43 @@ async def check_rate_limit(telegram_id: int) -> bool:
         logger.warning(f"Rate limit hit: user={telegram_id} count={count}")
         return False
     return True
+
+
+# === Daily cap (free-mode защита от абьюза, UTC-сутки) ===
+
+def _daily_cap_key(telegram_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    return f"dailycap:{telegram_id}:{now:%Y%m%d}"
+
+
+async def get_daily_used(telegram_id: int) -> int:
+    """Сколько решений юзер уже использовал в UTC-сутках. Read-only."""
+    raw = await get_redis().get(_daily_cap_key(telegram_id))
+    return int(raw or 0)
+
+
+async def check_daily_cap(telegram_id: int, cap: int, username: Optional[str] = None) -> tuple[bool, int]:
+    """Проверить можно ли ещё решить сегодня (БЕЗ инкремента).
+
+    Возвращает (ok, used). Админ → (True, 0). Инкремент — `bump_daily_used` после
+    успешной доставки (как consume_credits).
+    """
+    if is_admin(username):
+        return True, 0
+    used = await get_daily_used(telegram_id)
+    return (used < cap), used
+
+
+async def bump_daily_used(telegram_id: int, username: Optional[str] = None) -> int:
+    """Инкрементировать дневной счётчик. Вызывать после успешного solve."""
+    if is_admin(username):
+        return 0
+    redis = get_redis()
+    key = _daily_cap_key(telegram_id)
+    n = await redis.incr(key)
+    if n == 1:
+        await redis.expire(key, 26 * 3600)  # TTL чуть больше суток
+    return n
 
 
 # === Админ-чек ===

@@ -23,7 +23,8 @@ from aiogram.types import (
 )
 from loguru import logger
 
-from app.ai.pipeline import solve_task_from_photo
+from app.ai.pipeline import solve_task_from_photo, solve_task_from_text
+from app.ai.haiku_gate import is_math_or_physics
 from app.bot.keyboards import (
     BTN_BALANCE,
     BTN_BUY_CREDITS,
@@ -38,13 +39,19 @@ from app.bot.messages import (
     MSG_ADMIN_HELP,
     MSG_ADMIN_WELCOME,
     MSG_BUY_CREDITS_PROMPT,
+    MSG_DAILY_CAP_REACHED,
     MSG_DEMO_CAPTION,
     MSG_ERROR,
     MSG_HELP_CREDITS,
+    MSG_HELP_FREE,
+    MSG_NOT_MATH,
     MSG_OCR_FAILED_STANDARD,
     MSG_PROCESSING,
     MSG_START_CREDITS,
+    MSG_START_FREE,
+    MSG_TEXT_PROCESSING,
     msg_balance_credits,
+    msg_balance_free,
     msg_choose_task,
     msg_insufficient_credits,
     msg_mode_prompt,
@@ -53,9 +60,13 @@ from app.config import settings
 from app.core.redis import get_redis
 from app.analytics import log_event
 from app.ratelimit import (
+    CreditStatus,
+    bump_daily_used,
+    check_daily_cap,
     check_rate_limit,
     consume_credits,
     get_credit_status,
+    get_daily_used,
     get_or_create_user,
     is_admin,
 )
@@ -93,7 +104,8 @@ async def cmd_start(message: Message):
     log_event(user.id, "start")
     kb = main_menu_keyboard(is_admin=is_admin(user.username))
     prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
-    await message.answer(prefix + MSG_START_CREDITS, reply_markup=kb)
+    start_body = MSG_START_FREE if settings.free_mode else MSG_START_CREDITS
+    await message.answer(prefix + start_body, reply_markup=kb)
 
     if _DEMO_PATH.exists():
         try:
@@ -113,9 +125,8 @@ async def cmd_menu(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     user = message.from_user
-    help_text = MSG_HELP_CREDITS
-    if is_admin(user.username):
-        help_text = f"{MSG_HELP_CREDITS}\n\n{MSG_ADMIN_HELP}"
+    base = MSG_HELP_FREE if settings.free_mode else MSG_HELP_CREDITS
+    help_text = f"{base}\n\n{MSG_ADMIN_HELP}" if is_admin(user.username) else base
     await message.answer(help_text, reply_markup=main_menu_keyboard(is_admin=is_admin(user.username)))
 
 
@@ -138,6 +149,9 @@ async def menu_help(message: Message):
 
 @router.message(F.text == BTN_BUY_CREDITS)
 async def menu_buy_credits(message: Message):
+    if settings.free_mode:
+        await message.answer("✨ Бот сейчас полностью бесплатный — пакеты не нужны.")
+        return
     if is_admin(message.from_user.username):
         await message.answer("👑 У тебя безлимит как у админа — кредиты не нужны.")
         return
@@ -150,6 +164,14 @@ async def _send_balance(message: Message):
         telegram_id=user.id, username=user.username,
         first_name=user.first_name, last_name=user.last_name,
     )
+    if settings.free_mode:
+        adm = is_admin(user.username)
+        used = 0 if adm else await get_daily_used(user.id)
+        await message.answer(
+            msg_balance_free(used, is_admin=adm),
+            reply_markup=main_menu_keyboard(is_admin=adm),
+        )
+        return
     status = await get_credit_status(user.id, username=user.username)
     await message.answer(
         msg_balance_credits(status),
@@ -193,7 +215,11 @@ def _make_status_cb(processing_msg: Message):
 async def _present_modes(
     message: Message, bot: Bot, file_id: str, is_pdf: bool, hint: str,
 ) -> None:
-    """Фото/документ получены: сохраняем в Redis, предлагаем выбрать режим."""
+    """Фото/документ получены.
+
+    Free-mode: проверяем daily cap → сразу решаем как standard (бесплатно).
+    Credit-mode: сохраняем в Redis, предлагаем выбрать режим.
+    """
     user = message.from_user
     await get_or_create_user(
         telegram_id=user.id, username=user.username,
@@ -204,8 +230,24 @@ async def _present_modes(
         await message.answer("⏱ Слишком быстро! Подожди минутку и попробуй снова.")
         return
 
+    # ── FREE MODE ── ничего не списываем, без выбора режима.
+    if settings.free_mode:
+        adm = is_admin(user.username)
+        if not adm:
+            ok, _used = await check_daily_cap(user.id, settings.free_daily_cap)
+            if not ok:
+                await message.answer(MSG_DAILY_CAP_REACHED)
+                return
+        processing_msg = await message.answer(MSG_PROCESSING)
+        await _run_solve(
+            bot, message.chat.id, processing_msg, user,
+            file_id, is_pdf, hint, mode="standard", cost=0,
+            status=CreditStatus(is_admin=adm),
+        )
+        return
+
+    # ── CREDIT MODE ──
     status = await get_credit_status(user.id, username=user.username)
-    # Не хватает даже на стандарт → сразу paywall.
     if not status.is_admin and status.credits < settings.standard_cost:
         log_event(user.id, "paywall_shown")
         await message.answer(
@@ -248,9 +290,11 @@ async def handle_document(message: Message, bot: Bot):
 
 
 def _caption(status, mode: str, cost: int) -> str:
-    label = _mode_label(mode)
     if status.is_admin:
-        return f"✅ Готово · {label} · 👑 админ"
+        return "✅ Готово · 👑 админ"
+    if settings.free_mode:
+        return "✅ Готово · ✨ бесплатно"
+    label = _mode_label(mode)
     left = max(0, status.credits - cost)
     return f"✅ Готово · {label} (−{cost}). Кредитов осталось: {left}"
 
@@ -312,7 +356,10 @@ async def _run_solve(
             image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": hint, "mode": mode},
             allow_resolve=True,
         )
-        await consume_credits(user.id, cost, username=user.username)
+        if settings.free_mode:
+            await bump_daily_used(user.id, username=user.username)
+        else:
+            await consume_credits(user.id, cost, username=user.username)
         log_event(user.id, "solve")
 
     except Exception as e:
@@ -588,14 +635,73 @@ async def handle_resolve(callback: CallbackQuery, bot: Bot):
 
 
 @router.message(F.text)
-async def handle_text(message: Message):
-    """Любой текст не из меню — подсказка."""
-    kb = main_menu_keyboard(is_admin=is_admin(message.from_user.username))
-    await message.answer(
-        "📸 Кинь <b>фото</b> задачи — предложу выбрать режим и решу.\n"
-        "Или выбери из меню под клавиатурой 👇",
-        reply_markup=kb,
+async def handle_text(message: Message, bot: Bot):
+    """Любой текстовый ввод (не команда, не кнопка меню).
+
+    Free-mode: пускаем через Haiku-гейт (математика/физика?). Если да — решаем
+    текстовый ввод напрямую через DeepSeek. Если нет — вежливый отказ.
+    Credit-mode: подсказка прислать фото (мы не делаем text-input платным сейчас).
+    """
+    user = message.from_user
+    text = (message.text or "").strip()
+
+    if not settings.free_mode:
+        kb = main_menu_keyboard(is_admin=is_admin(user.username))
+        await message.answer(
+            "📸 Кинь <b>фото</b> задачи — предложу выбрать режим и решу.\n"
+            "Или выбери из меню под клавиатурой 👇",
+            reply_markup=kb,
+        )
+        return
+
+    # FREE MODE: пробуем как math/physics задачу.
+    await get_or_create_user(
+        telegram_id=user.id, username=user.username,
+        first_name=user.first_name, last_name=user.last_name,
     )
+    if not await check_rate_limit(user.id):
+        await message.answer("⏱ Слишком быстро! Подожди минутку.")
+        return
+
+    adm = is_admin(user.username)
+    if not adm:
+        ok, _used = await check_daily_cap(user.id, settings.free_daily_cap)
+        if not ok:
+            await message.answer(MSG_DAILY_CAP_REACHED)
+            return
+
+    # Гейт темы (Haiku) — отсекаем не-математику/физику.
+    if settings.topic_gate_enabled:
+        is_math = await is_math_or_physics(text)
+        if not is_math:
+            await message.answer(MSG_NOT_MATH)
+            return
+
+    processing_msg = await message.answer(MSG_TEXT_PROCESSING)
+    try:
+        result = await solve_task_from_text(
+            condition_text=text, user_id=user.id,
+            on_status=_make_status_cb(processing_msg),
+        )
+        if result.get("empty_input"):
+            try:
+                await processing_msg.edit_text("📝 Условие слишком короткое — пришли больше деталей.")
+            except Exception:
+                pass
+            return
+        await _send_solution_result(
+            bot, message.chat.id, processing_msg, result,
+            caption=_caption(CreditStatus(is_admin=adm), "standard", 0),
+            image_ref=None, allow_resolve=False,  # для text-input «перерешать» пока не делаем
+        )
+        await bump_daily_used(user.id, username=user.username)
+        log_event(user.id, "solve")
+    except Exception as e:
+        logger.exception(f"text-solve error for user {user.id}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_ERROR)
+        except Exception:
+            await message.answer(MSG_ERROR)
 
 
 # ─── утилиты ──────────────────────────────────────────────────────────

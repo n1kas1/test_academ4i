@@ -19,9 +19,13 @@ def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> Repl
 
     Параметр is_premium сохранён для совместимости вызовов, в credit-модели не влияет.
     """
-    if is_admin:
+    # Free-mode и админ — без кнопки покупки.
+    if is_admin or settings.free_mode:
         keyboard = [[KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HELP)]]
-        placeholder = "📸 Кинь фото задачи (админ — безлимит)"
+        if is_admin:
+            placeholder = "📸 Кинь фото задачи (админ — безлимит)"
+        else:
+            placeholder = "📸 Кинь фото или ✍️ напиши условие"
     else:
         keyboard = [
             [KeyboardButton(text=BTN_BUY_CREDITS)],
