@@ -79,7 +79,7 @@ async def on_successful_payment(message: Message):
         logger.error(f"successful_payment with unknown payload: {payload}")
         await message.answer(
             "Платёж прошёл, но мы не смогли распознать что куплено. "
-            "Напиши в @Academ4I_support."
+            "Напиши @manag31."
         )
         return
 

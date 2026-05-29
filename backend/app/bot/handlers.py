@@ -506,9 +506,23 @@ async def _send_solution_result(
         pass
 
     if not pdf_bytes and not png_bytes:
-        logger.warning("Render failed — sending LaTeX as text")
-        for ch in _split_for_telegram(latex_text or "Не удалось оформить решение."):
-            await bot.send_message(chat_id, f"<pre>{_escape_html(ch)}</pre>")
+        # Авто-фиксы LaTeX исчерпаны. Не оставляем юзера с голым текстом —
+        # отдаём готовый .tex-файл, чтобы можно было собрать в Overleaf.
+        logger.warning("Render failed — sending .tex as document fallback")
+        tex_payload = (latex_text or "% решение не получилось").encode("utf-8")
+        try:
+            await bot.send_document(
+                chat_id,
+                document=BufferedInputFile(tex_payload, filename="solution.tex"),
+                caption=(
+                    "📄 PDF не получился, но вот LaTeX-исходник.\n\n"
+                    "Открой <b>Overleaf</b> (online, бесплатно) и собери PDF там, "
+                    "либо напиши @manag31."
+                ),
+            )
+        except Exception as e:
+            logger.warning(f".tex fallback send failed: {e}")
+            await bot.send_message(chat_id, MSG_ERROR)
         return
 
     token = secrets.token_urlsafe(8)

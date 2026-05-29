@@ -36,7 +36,7 @@ from typing import Awaitable, Callable, Optional
 from loguru import logger
 
 from app.ai.vision import prepare_image
-from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex
+from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
 from app.ai.deepseek import solve_with_deepseek
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
@@ -44,27 +44,46 @@ from app.render.latex_to_png import render_solution
 
 
 async def _render_with_autofix(latex: str) -> tuple[dict, str]:
-    """Рендер; при ошибке компиляции pdflatex — один авто-фикс LaTeX (Haiku) и повтор.
+    """Рендер с двух-tier авто-фиксом: Haiku → Sonnet. Цель — гарантировать PDF.
 
-    Возвращает (rendered, final_latex). Если фикс удался — final_latex исправленный
-    (он же уйдёт в кнопку «Показать LaTeX»); иначе исходный (для текстового фолбэка).
+    Tier 0: рендер как есть.
+    Tier 1: Haiku-фикс по логу ошибки → re-render.
+    Tier 2: Sonnet-фикс (стоит дороже, но надёжнее) → re-render.
+    Если все провалились — возвращаем последний рендер (caller отправит .tex-файлом).
     """
     rendered = await render_solution(latex)
     if rendered["pdf"] or not rendered.get("error"):
         return rendered, latex
-    logger.warning("render failed — пробую авто-фикс LaTeX через Haiku")
+
+    # Tier 1 — Haiku
+    logger.warning("render failed — авто-фикс через Haiku")
     try:
         fixed = await fix_latex(latex, rendered["error"])
     except Exception as e:
-        logger.warning(f"fix_latex failed: {e}")
+        logger.warning(f"fix_latex (haiku) failed: {e}")
+        fixed = None
+    if fixed and fixed.strip() != latex.strip():
+        rerendered = await render_solution(fixed)
+        if rerendered["pdf"]:
+            logger.info("Haiku-фикс удался → PDF собран")
+            return rerendered, fixed
+        latex, rendered = fixed, rerendered  # перейдём ко 2-му tier с обновлённой ошибкой
+
+    # Tier 2 — Sonnet (более тщательный фикс, редко зовётся)
+    logger.warning("Haiku не вытянул — пробую Sonnet-фикс")
+    try:
+        fixed2 = await fix_latex_strong(latex, rendered.get("error") or "")
+    except Exception as e:
+        logger.warning(f"fix_latex_strong (sonnet) failed: {e}")
         return rendered, latex
-    if not fixed or fixed.strip() == latex.strip():
-        return rendered, latex
-    rerendered = await render_solution(fixed)
-    if rerendered["pdf"]:
-        logger.info("LaTeX авто-фикс удался → PDF собран")
-        return rerendered, fixed
-    logger.warning("авто-фикс не помог — текстовый фолбэк")
+    if fixed2 and fixed2.strip() != latex.strip():
+        re2 = await render_solution(fixed2)
+        if re2["pdf"]:
+            logger.info("Sonnet-фикс удался → PDF собран")
+            return re2, fixed2
+        rendered, latex = re2, fixed2
+
+    logger.warning("Все авто-фиксы исчерпаны — отдадим LaTeX в .tex-файле")
     return rendered, latex
 
 CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated

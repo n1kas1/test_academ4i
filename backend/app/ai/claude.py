@@ -354,3 +354,34 @@ async def fix_latex(broken_latex: str, error_log: str) -> str:
         f"≈{estimate_cost_rub(settings.ocr_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽"
     )
     return out or broken_latex
+
+
+async def fix_latex_strong(broken_latex: str, error_log: str) -> str:
+    """Жёсткий tier авто-фикса (Sonnet) — когда Haiku не справился.
+
+    Тот же системный промпт, что и у `fix_latex`, но модель сильнее. Зовётся
+    редко (только когда первый автофикс не вытянул) — стоит дороже, но
+    гарантирует PDF в подавляющем большинстве случаев.
+    """
+    client = get_client()
+    user_msg = (
+        f"Ошибка pdflatex (предыдущий фикс не помог, нужна более тщательная правка):\n"
+        f"{error_log[-1500:]}\n\n"
+        f"LaTeX-фрагмент (почини и верни целиком):\n{broken_latex}"
+    )
+    response = await client.messages.create(
+        model=settings.claude_model,
+        max_tokens=4096,
+        system=_FIX_LATEX_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    out = "".join(b.text for b in response.content if b.type == "text").strip()
+    fence = re.search(r"```(?:latex)?\s*(.*?)```", out, re.DOTALL)
+    if fence:
+        out = fence.group(1).strip()
+    logger.info(
+        f"fix_latex_strong [{settings.claude_model}]: in={response.usage.input_tokens}, "
+        f"out={response.usage.output_tokens}, "
+        f"≈{estimate_cost_rub(settings.claude_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽"
+    )
+    return out or broken_latex
