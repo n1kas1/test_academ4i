@@ -519,34 +519,26 @@ async def _send_solution_result(
         )
         return
 
-    token = secrets.token_urlsafe(8)
-    payload = {"latex": latex_text}
+    # Сохраняем данные для кнопки «Перерешать» — только если она есть.
     can_resolve = bool(allow_resolve and image_ref and image_ref.get("file_id"))
+    kb = None
     if can_resolve:
-        payload.update(image_ref)
-    await get_redis().set(f"sol:{token}", json.dumps(payload), ex=SOLUTION_TTL_SECONDS)
-    kb = solution_keyboard(token, allow_resolve=can_resolve)
+        token = secrets.token_urlsafe(8)
+        payload = {"latex": latex_text, **image_ref}
+        await get_redis().set(f"sol:{token}", json.dumps(payload), ex=SOLUTION_TTL_SECONDS)
+        kb = solution_keyboard(token, allow_resolve=True)
 
-    if png_bytes and pdf_bytes:
-        await bot.send_photo(
-            chat_id,
-            photo=BufferedInputFile(png_bytes, filename="preview.png"),
-            caption=caption,
-        )
-        await bot.send_document(
-            chat_id,
-            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
-            caption="📄 Полное решение — открой, чтобы увеличить и пролистать.",
-            reply_markup=kb,
-        )
-    elif pdf_bytes:
+    # Одно сообщение: PDF-документ с подписью + (опц.) кнопкой «Перерешать».
+    # Telegram сам показывает первую страницу PDF как превью.
+    if pdf_bytes:
         await bot.send_document(
             chat_id,
             document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
             caption=caption,
             reply_markup=kb,
         )
-    else:
+    elif png_bytes:
+        # Очень редкий fallback: PDF не получился, есть только превью PNG.
         await bot.send_photo(
             chat_id,
             photo=BufferedInputFile(png_bytes, filename="solution.png"),
@@ -566,24 +558,6 @@ async def _load_sol(token: str) -> dict | None:
         return json.loads(raw)
     except Exception:
         return None
-
-
-@router.callback_query(F.data.startswith("latex:"))
-async def handle_show_latex(callback: CallbackQuery):
-    token = callback.data.removeprefix("latex:")
-    data = await _load_sol(token)
-    latex_text = (data or {}).get("latex")
-
-    if not latex_text:
-        await callback.answer(
-            "LaTeX недоступен (хранится 1 час). Кинь задачу снова.",
-            show_alert=True,
-        )
-        return
-
-    for ch in _split_for_telegram(latex_text, max_len=3500):
-        await callback.message.answer(f"<pre>{_escape_html(ch)}</pre>", parse_mode="HTML")
-    await callback.answer("LaTeX отправлен — можно копировать")
 
 
 @router.callback_query(F.data.startswith("resolve:"))
