@@ -200,6 +200,33 @@ SYSTEM_PROMPT = r"""Ты — эксперт по высшей математик
 - НЕ используй emoji в LaTeX, T2A их не поддерживает
 - НЕ используй \section, \chapter, \part — у нас не такая структура
 
+⚠️ КРИТИЧЕСКИЕ ЗАПРЕТЫ (нарушение → pdflatex не компилирует):
+
+1. Два типа math-окружений — НЕ ПУТАЙ:
+   (a) ТРЕБУЮТ внешнего math: cases, aligned, pmatrix, matrix, bmatrix,
+       vmatrix, Bmatrix, Vmatrix, split.
+       → ставь внутри $$...$$ (или \[...\]).
+       ✓ $$ \begin{cases} 1, & x>0 \\ 0, & x\le 0 \end{cases} $$
+       ✗ $\begin{cases}...\end{cases}$    — Missing $ inserted.
+   (b) САМИ display, оборачивать НЕЛЬЗЯ: align*, gather*, multline*,
+       equation*, displaymath. Пиши их напрямую в текст, без $$/\[.
+       ✓ \begin{align*} a &= 1 \\ b &= 2 \end{align*}
+       ✗ $$ \begin{align*}...\end{align*} $$    — Bad math environment delimiter.
+
+2. Внутри \ans{...} — ТОЛЬКО короткое inline-выражение (там \boxed).
+     ✓ \ans{\dfrac{\pi}{2}}      \ans{x^2 - 2x + 1}      \ans{e^{i\pi} = -1}
+     ✗ \ans{\begin{cases}...\end{cases}}      ✗ многострочные системы со \\
+   Если ответ — система/матрица: ВЫНЕСИ её $$...$$ ПЕРЕД \hd{Ответ}, а в \ans
+   поставь короткий итог:
+     $$ f(x) = \begin{cases} 1, & x>0 \\ 0, & x\le 0 \end{cases} $$
+     \hd{Ответ}
+     \ans{f(x) \text{ — кусочно-заданная функция}}
+
+3. Русский текст внутри ЛЮБОГО math-режима ОБЯЗАН быть в \text{...}.
+   Это $...$, $$...$$, \(...\), \[...\] и любые math-окружения.
+     ✗ $x при y = 0$           — \cyrm invalid in math mode
+     ✓ $x \text{ при } y = 0$
+
 ═══════════════════════════════════════════════════════════════════════
 СТРУКТУРА ОТВЕТА — СТРОГО ВОТ ТАК
 ═══════════════════════════════════════════════════════════════════════
@@ -266,7 +293,7 @@ async def solve_with_claude_vision(
         },
     ]
 
-    text_parts = ["На фото задача по высшей математике. Распознай её и реши пошагово в указанном HTML-формате."]
+    text_parts = ["На фото задача по высшей математике. Распознай её и реши пошагово в указанном LaTeX-формате."]
 
     if user_hint:
         safe_hint = html.escape(user_hint)

@@ -198,3 +198,136 @@ async def test_pipeline_multi_task_needs_choice(monkeypatch):
     assert res["task_ids"] == ["2851", "2852"]
     ds.assert_not_awaited()
     cv.assert_not_awaited()
+
+
+# ─────────────────────── latex_sanitize ───────────────────────────────
+
+def test_sanitize_strips_emoji():
+    from app.ai.latex_sanitize import sanitize_for_render
+    out = sanitize_for_render(r"\hd{Условие 🎯}")
+    assert "🎯" not in out and "Условие" in out
+
+
+def test_sanitize_inline_with_cases_becomes_display():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"\ans{$f(x) = \begin{cases} 1, & x>0 \\ 0, & x\leq 0 \end{cases}$}"
+    out = sanitize_for_render(src)
+    # \ans с block-env превращается в выносной $$..$$ + короткий \ans
+    assert "$$" in out
+    assert r"\begin{cases}" in out
+    assert r"\ans{\text{см. формулу выше}}" in out
+
+
+def test_sanitize_inline_align_becomes_display():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"Имеем $\begin{align*} a &= b \\ c &= d \end{align*}$ — конец."
+    out = sanitize_for_render(src)
+    # Inline $...align*...$ переходит в display $$...align*...$$
+    assert "$$" in out
+    assert r"\begin{align*}" in out
+
+
+def test_sanitize_wraps_cyrillic_in_inline_math():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$x \text{ при } y = 0$"  # уже корректно — не должно меняться (идемпотентно)
+    out = sanitize_for_render(src)
+    assert out == src
+
+
+def test_sanitize_wraps_unwrapped_cyrillic_in_math():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$x при y = 0$"
+    out = sanitize_for_render(src)
+    assert r"\text{при}" in out
+
+
+def test_sanitize_wraps_cyrillic_in_display_math():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$$\eta = сумма ряда$$"
+    out = sanitize_for_render(src)
+    assert r"\text{сумма ряда}" in out or r"\text{сумма}" in out
+
+
+def test_sanitize_wraps_cyrillic_in_align_env():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"\begin{align*} F(x) &= где &x > 0 \end{align*}"
+    out = sanitize_for_render(src)
+    assert r"\text{где}" in out
+
+
+def test_sanitize_doesnt_wrap_single_cyrillic_letter():
+    """Одиночная кир-буква может быть переменной (х, у, ξ-как-х) — не оборачиваем."""
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$х + у = 0$"  # одиночные буквы
+    out = sanitize_for_render(src)
+    assert r"\text{х}" not in out
+
+
+def test_sanitize_is_idempotent():
+    """Повторный прогон не меняет результат."""
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"\ans{$f(x) = \begin{cases} a, & x>0 \\ b, & x\leq 0 \end{cases}$} и $\eta = сумма$"
+    once = sanitize_for_render(src)
+    twice = sanitize_for_render(once)
+    assert once == twice
+
+
+def test_sanitize_preserves_clean_input():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"\hd{Условие} $x^2 + 1 = 0$ \hd{Ответ} \ans{x = \pm i}"
+    out = sanitize_for_render(src)
+    assert out == src
+
+
+# ─── балансовый парсер \ans (баг #3 из ревью): глубокая вложенность ───
+
+def test_sanitize_ans_with_deeply_nested_dfrac_unchanged():
+    """\\ans{\\dfrac{x^{2}+1}{x-1}} — 2+ уровня {}, должен остаться как есть."""
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"\ans{\dfrac{x^{2}+1}{x-1}}"
+    out = sanitize_for_render(src)
+    assert out == src
+
+
+def test_sanitize_ans_with_block_extracts_keeping_outer_text():
+    """\\ans{...\\begin{cases}...\\end{cases}...} → блок выносится, хвост сохраняется."""
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"Хвост перед. \ans{\dfrac{a^{2}}{b} + \begin{cases} 1, & x>0 \\ 0, & x\leq 0 \end{cases}} Хвост после."
+    out = sanitize_for_render(src)
+    assert "Хвост перед." in out and "Хвост после." in out
+    assert r"\ans{\text{см. формулу выше}}" in out
+    assert r"\begin{cases}" in out
+    assert "$$" in out
+
+
+# ─── multi-pass _stash_text (баг #5): вложенный \text{\textbf{...}} ───
+
+def test_sanitize_no_runaway_wrap_with_nested_text_textbf():
+    """\\text{слово \\textbf{другое слово}} — внешний \\text не должен «доразвернуть»
+    кириллицу внутри (если внутри math-режима). Идемпотентно."""
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$\text{итог \textbf{очень важно} здесь}$"
+    once = sanitize_for_render(src)
+    twice = sanitize_for_render(once)
+    # Двойной прогон даёт ту же строку — никаких \text{\text{...}}.
+    assert once == twice
+    assert r"\text{\text{" not in once
+
+
+# ─── _CYR_WORD_RE: проверка, что одиночные кир-буквы не оборачиваются ───
+
+def test_sanitize_single_cyr_letters_unchanged():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$х + у = 0$"  # одиночные кир-буквы — переменные
+    out = sanitize_for_render(src)
+    assert out == src
+
+
+# ─── display-math с конкретным wrap кириллицы ───────────────────────────
+
+def test_sanitize_wraps_full_phrase_in_display_math():
+    from app.ai.latex_sanitize import sanitize_for_render
+    src = r"$$\eta = сумма ряда$$"
+    out = sanitize_for_render(src)
+    # Фраза целиком должна попасть в один \text{}.
+    assert r"\text{сумма ряда}" in out

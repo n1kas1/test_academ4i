@@ -38,6 +38,7 @@ from loguru import logger
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
 from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek
+from app.ai.latex_sanitize import sanitize_for_render
 from app.render.plain_pdf import render_plain_pdf
 from app.config import settings as _settings
 from app.ai.embeddings import embed_text
@@ -69,7 +70,13 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
       3) DeepSeek-plain (тот же DeepSeek, другой системный промпт) → ReportLab PDF.
     paid_mode (дорогой путь, использовался ранее):
       Haiku-fix → Sonnet-fix → verbatim.
+
+    Sanitize применяется ВНУТРИ этой функции — покрывает все вызовы:
+    cache-hit (старые записи в БД), pipeline cache-miss, OCR-fallback,
+    плюс выходы fix-моделей.
     """
+    latex = sanitize_for_render(latex)
+
     # Free-mode короткий путь: уже plain → ReportLab.
     if _settings.free_mode and _is_plain_format(latex):
         rendered = await render_plain_pdf(latex)
@@ -85,6 +92,8 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
         logger.warning("render failed — DeepSeek-fix LaTeX (free-mode)")
         try:
             fixed = await fix_latex_with_deepseek(latex, rendered["error"])
+            if fixed:
+                fixed = sanitize_for_render(fixed)
             if fixed and fixed.strip() != latex.strip():
                 re_rend = await render_solution(fixed)
                 if re_rend["pdf"]:
@@ -111,6 +120,8 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
     logger.warning("render failed — Haiku-fix (paid-mode)")
     try:
         fixed = await fix_latex(latex, rendered["error"])
+        if fixed:
+            fixed = sanitize_for_render(fixed)
     except Exception as e:
         logger.warning(f"fix_latex (haiku) failed: {e}")
         fixed = None
@@ -123,6 +134,8 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
     logger.warning("Haiku не вытянул — Sonnet-fix (paid)")
     try:
         fixed2 = await fix_latex_strong(latex, rendered.get("error") or "")
+        if fixed2:
+            fixed2 = sanitize_for_render(fixed2)
     except Exception as e:
         logger.warning(f"fix_latex_strong (sonnet) failed: {e}")
         return rendered, latex
@@ -280,7 +293,7 @@ async def solve_task_from_photo(
         )
         latex_clean = _clean_latex(latex_raw)
         await _status(on_status, "🖼 Оформляю решение…")
-        # condition_text=""— на этой ветке OCR провалился, plain-fallback не сможет.
+        # Sanitize применяется внутри _render_with_autofix (централизованно).
         rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text="")
         return {"latex": latex_clean, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
@@ -353,7 +366,9 @@ async def solve_task_from_photo(
             rag_context=rag_context,
             use_thinking=True,
         )
-    latex_clean = _clean_latex(solution_raw)
+    # Sanitize ПЕРЕД сохранением в кэш — чтобы будущим юзерам не приходил
+    # сломанный LaTeX, который потом будет провоцировать дорогую цепочку фиксов.
+    latex_clean = sanitize_for_render(_clean_latex(solution_raw))
 
     # 8) Сохраняем LaTeX в кэш для будущих юзеров
     try:
@@ -434,7 +449,7 @@ async def solve_task_from_text(
         rag_context=rag_context,
         user_hint=user_hint,
     )
-    latex_clean = _clean_latex(solution_raw)
+    latex_clean = sanitize_for_render(_clean_latex(solution_raw))
 
     try:
         await save_solution(
