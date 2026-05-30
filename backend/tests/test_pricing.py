@@ -331,3 +331,44 @@ def test_sanitize_wraps_full_phrase_in_display_math():
     out = sanitize_for_render(src)
     # Фраза целиком должна попасть в один \text{}.
     assert r"\text{сумма ряда}" in out
+
+
+# ─────────────────────── admin /stats period start ───────────────────
+
+def test_period_start_day1_is_msk_midnight():
+    """days=1 должен дать начало МСК-суток (00:00 МСК), а не «−24h»."""
+    from datetime import datetime, timezone, timedelta
+    from app.bot.admin import _period_start
+    start = _period_start(1)
+    assert start.tzinfo is not None
+    # Перевод в МСК должен дать 00:00:00.
+    msk = start.astimezone(timezone(timedelta(hours=3)))
+    assert (msk.hour, msk.minute, msk.second) == (0, 0, 0)
+
+
+def test_period_start_7d_is_rolling_window():
+    """days=7 — скользящее окно, не привязано к началу суток."""
+    from datetime import datetime, timezone, timedelta
+    from app.bot.admin import _period_start
+    start = _period_start(7)
+    delta = datetime.now(timezone.utc) - start
+    # ≈ 7 дней с допуском в пару секунд на выполнение.
+    assert timedelta(days=7) - timedelta(seconds=5) <= delta <= timedelta(days=7) + timedelta(seconds=5)
+
+
+def test_estimated_cost_free_mode(monkeypatch):
+    from app.bot.admin import _estimated_cost_rub
+    from app.config import settings
+    monkeypatch.setattr(settings, "free_mode", True)
+    avg, total = _estimated_cost_rub(20)
+    assert avg == 0.5
+    assert total == 10.0
+
+
+def test_estimated_cost_paid_mode(monkeypatch):
+    from app.bot.admin import _estimated_cost_rub
+    from app.config import settings
+    monkeypatch.setattr(settings, "free_mode", False)
+    avg, total = _estimated_cost_rub(20)
+    assert avg == 4.0
+    assert total == 80.0
