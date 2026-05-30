@@ -6,6 +6,7 @@
 Webhook от Telegram приходит на POST /webhook,
 секрет проверяется через X-Telegram-Bot-Api-Secret-Token.
 """
+import asyncio
 import logging
 import socket
 from contextlib import asynccontextmanager
@@ -21,7 +22,7 @@ from app.config import settings
 from app.bot import admin, handlers
 from app.payments import tg_stars
 from app.core.db import close_db, init_db
-from app.core.redis import close_redis, init_redis
+from app.core.redis import close_redis, get_redis, init_redis
 
 # === Aiogram setup ===
 bot = Bot(
@@ -85,16 +86,38 @@ async def health():
     return {"status": "ok"}
 
 
+async def _process_update_bg(update: Update) -> None:
+    """Фоновая обработка update'а. Логируем исключения, чтобы не терялись."""
+    try:
+        await dp.feed_update(bot, update)
+    except Exception:
+        logger.exception(f"update {update.update_id} processing failed")
+
+
 @app.post("/webhook")
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str = Header(None),
 ):
-    """Принимаем апдейты от Telegram."""
+    """Принимаем апдейты от Telegram.
+
+    Возвращаем 200 OK МГНОВЕННО, обработку запускаем в фоне:
+    - Telegram-таймаут вебхука ~30с; долгий solve вызывает ретраи и дубли решений.
+    - Через update_id делаем дедуп: даже если ретрай прилетит — пропускаем.
+    """
     if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
         raise HTTPException(403, "Invalid secret")
 
     data = await request.json()
     update = Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, update)
+
+    # Дедуп: уникальная блокировка update_id на 10 мин.
+    redis = get_redis()
+    seen = not await redis.set(f"upd:{update.update_id}", "1", nx=True, ex=600)
+    if seen:
+        logger.warning(f"duplicate update {update.update_id} skipped")
+        return {"ok": True}
+
+    # Fire-and-forget: возвращаем 200 OK сразу, обрабатываем в фоне.
+    asyncio.create_task(_process_update_bg(update))
     return {"ok": True}
