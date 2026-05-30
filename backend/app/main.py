@@ -72,6 +72,18 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutting down...")
+    # Ждём in-flight обработки апдейтов — чтобы не терять решения после
+    # списания кредитов / показа MSG_PROCESSING юзеру. 30с потолок.
+    if _BG_TASKS:
+        n = len(_BG_TASKS)
+        logger.info(f"waiting up to 30s for {n} in-flight updates...")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*list(_BG_TASKS), return_exceptions=True),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"shutdown: {len(_BG_TASKS)} updates still running, dropping")
     await bot.delete_webhook()
     await bot.session.close()
     await close_db()
@@ -84,6 +96,16 @@ app = FastAPI(title="academ4i", lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# Сильные ссылки на background-таски: event loop держит только weak-ref,
+# поэтому без этого set'а GC может прибить task посреди работы (баг Python:
+# https://docs.python.org/3/library/asyncio-task.html#creating-tasks).
+_BG_TASKS: set[asyncio.Task] = set()
+
+# TTL дедупа update_id: Telegram может ретраить webhook часами при ошибках.
+# 24 часа — с запасом, ключи в Redis копеечные.
+WEBHOOK_DEDUP_TTL_SEC = 24 * 3600
 
 
 async def _process_update_bg(update: Update) -> None:
@@ -109,15 +131,22 @@ async def telegram_webhook(
         raise HTTPException(403, "Invalid secret")
 
     data = await request.json()
+    # Дедуп ставим как можно раньше, ещё до model_validate, чтобы любой
+    # повтор (даже c битым payload) не приводил к двойной обработке.
+    update_id = data.get("update_id") if isinstance(data, dict) else None
+    if update_id is not None:
+        redis = get_redis()
+        seen = not await redis.set(
+            f"upd:{update_id}", "1", nx=True, ex=WEBHOOK_DEDUP_TTL_SEC,
+        )
+        if seen:
+            logger.warning(f"duplicate update {update_id} skipped")
+            return {"ok": True}
+
     update = Update.model_validate(data, context={"bot": bot})
 
-    # Дедуп: уникальная блокировка update_id на 10 мин.
-    redis = get_redis()
-    seen = not await redis.set(f"upd:{update.update_id}", "1", nx=True, ex=600)
-    if seen:
-        logger.warning(f"duplicate update {update.update_id} skipped")
-        return {"ok": True}
-
-    # Fire-and-forget: возвращаем 200 OK сразу, обрабатываем в фоне.
-    asyncio.create_task(_process_update_bg(update))
+    # Fire-and-forget: запускаем в фоне и держим strong-ref до завершения.
+    task = asyncio.create_task(_process_update_bg(update))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
     return {"ok": True}
