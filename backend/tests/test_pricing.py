@@ -463,3 +463,62 @@ def test_system_prompt_has_injection_defence():
         low = prompt.lower()
         assert "<task>" in low
         assert "игнор" in low  # «игнорируешь»/«игнорируй»
+
+
+# ───────────────── OCR JSON парсер (live-bug фикс) ────────────────────
+
+def test_ocr_parse_clean_json():
+    from app.ai.claude import _parse_ocr_json
+    raw = '{"condition": "Найти производную y=x²", "task_ids": ["2407"]}'
+    cond, ids = _parse_ocr_json(raw)
+    assert cond == "Найти производную y=x²"
+    assert ids == ["2407"]
+
+
+def test_ocr_parse_markdown_wrapped_json():
+    """Haiku иногда оборачивает в ```json ... ``` — снимаем."""
+    from app.ai.claude import _parse_ocr_json
+    raw = '```json\n{"condition": "Вычислить ∫", "task_ids": ["1"]}\n```'
+    cond, ids = _parse_ocr_json(raw)
+    assert cond == "Вычислить ∫"
+    assert ids == ["1"]
+
+
+def test_ocr_parse_broken_json_unescaped_latex_quotes():
+    """Главный live-баг: Haiku не экранирует ' " ' внутри \\text{...}.
+    Чистый json.loads падает — regex-fallback должен спасти."""
+    from app.ai.claude import _parse_ocr_json
+    raw = (
+        '{"condition": "Найти ∫ функции \\text{"при" x>0}", "task_ids": ["2851"]}'
+    )
+    cond, ids = _parse_ocr_json(raw)
+    # condition вытащился (с экранированной кавычкой раскрытой обратно)
+    assert "Найти" in cond and "функции" in cond
+    assert ids == ["2851"]
+
+
+def test_ocr_parse_truly_broken_returns_empty():
+    """Если ни json.loads ни regex не помогли — возвращаем ('', []), чтобы
+    pipeline пошёл по ocr_failed-пути, а не подсунул мусор в DeepSeek."""
+    from app.ai.claude import _parse_ocr_json
+    raw = "это не json вообще и не очень похоже на что-то"
+    cond, ids = _parse_ocr_json(raw)
+    assert cond == ""
+    assert ids == []
+
+
+def test_ocr_parse_markdown_wrapped_broken_json():
+    """Комбо обоих кейсов: ```json...``` + битые кавычки внутри. Это РОВНО
+    то, что случилось 18:52 в логах: pipeline получил condition='```json...'.
+    После фикса — либо нормальный condition, либо ('', []), но НЕ markdown."""
+    from app.ai.claude import _parse_ocr_json
+    raw = (
+        '```json\n'
+        '{"condition": "Найти степенной ряд: $f(x) = \\text{"sin" x}$", '
+        '"task_ids": ["2851", "2852"]}\n'
+        '```'
+    )
+    cond, ids = _parse_ocr_json(raw)
+    # main check: condition НЕ начинается с ```json — иначе тот же баг.
+    assert not cond.startswith("```")
+    assert "json" not in cond[:10].lower() or "функ" in cond.lower() or len(cond) > 5

@@ -22,9 +22,13 @@ class Settings(BaseSettings):
     anthropic_base_url: str = "https://api.proxyapi.ru/anthropic"
     claude_model: str = "claude-sonnet-4-6"
     claude_use_extended_thinking: bool = True
-    # Модель лёгкого OCR-прохода (распознать условие + номера задач).
-    # Haiku: распознавание — простая работа, в разы дешевле Sonnet; решение остаётся на claude_model.
+    # Haiku — дешёвая модель для лёгких задач (topic-gate, fix_latex). НЕ для OCR.
     ocr_model: str = "claude-haiku-4-5-20251001"
+    # Vision-OCR условия задачи: Sonnet (≈2.6× дороже Haiku, но кратно меньше
+    # галлюцинаций на формулах). ≈1₽ за OCR vs 0.4₽ у Haiku. Стоит того —
+    # битый condition_text ломает всю цепочку решения, переплачивать на solve
+    # в разы дороже потерянной точности.
+    vision_ocr_model: str = "claude-sonnet-4-6"
 
     # === OpenAI — через ProxyAPI (для эмбеддингов и парсинга PDF) ===
     openai_api_key: str

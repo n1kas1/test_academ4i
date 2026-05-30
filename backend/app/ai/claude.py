@@ -45,14 +45,28 @@ def estimate_cost_rub(model: str, in_tok: int, out_tok: int) -> float:
 # 1) Извлечение условия задачи в текст (для RAG retrieval)
 # ───────────────────────────────────────────────────────────────────────
 
-OCR_SYSTEM = """Ты — OCR-распознаватель задач по точным дисциплинам (высшая математика, теория вероятностей и статистика, дискретная математика).
+OCR_SYSTEM = """Ты — OCR-распознаватель задач по точным дисциплинам (высшая математика, теория вероятностей и статистика, дискретная математика, физика).
 На фото — задача (или несколько) из учебника/задачника на русском. Аккуратно распознавай спецобозначения: вероятности P(A), мат. ожидание M[X]/E[X], дисперсию D[X], комбинаторику C_n^k, A_n^k, n!, символы множеств и логики (∈, ⊆, ∪, ∩, ∀, ∃, →, ¬), графы и таблицы.
 
-Верни СТРОГО JSON (без markdown-обёртки, без пояснений) вида:
+⚠️ КАТЕГОРИЧЕСКИЕ ПРАВИЛА АНТИ-ГАЛЛЮЦИНАЦИИ:
+1. Переписывай ровно то, что видишь. НЕ «улучшай», НЕ «нормализуй», НЕ дописывай
+   красивую структуру, которой нет.
+2. Если символ нечёткий и непонятен — поставь маркер ⟨?⟩ вместо догадки.
+3. Если фото слишком плохого качества / не задача / не виден текст —
+   возвращай "condition": "" (пустую строку). НЕ выдумывай формулу. Лучше
+   честный пустой ответ, чем псевдо-математика.
+4. Условие в "condition" должно быть СВЯЗНЫМ предложением. Если получается
+   набор не связанных символов — это сигнал, что фото не читается.
+
+Верни СТРОГО JSON (без markdown-обёртки ```json```, без пояснений до или после)
+вида:
 {
   "condition": "<текст условия НУЖНОЙ задачи одним абзацем, формулы в $...$>",
   "task_ids": ["<номера ВСЕХ отдельных задач, что видишь на фото>"]
 }
+
+Внутри JSON-строки "condition": если внутри есть двойная кавычка (например
+в \\text{...}), экранируй её обратным слэшем (\\"). Иначе JSON станет битым.
 
 Правила для "condition":
 - Если на фото ОДНА задача (даже с подзадачами а/б/в) — распознай её полностью.
@@ -67,31 +81,70 @@ OCR_SYSTEM = """Ты — OCR-распознаватель задач по точ
 - Перечисли только реально видимые на фото номера, по порядку."""
 
 
+def _normalize_task_ids(ids_raw) -> list[str]:
+    """Нормализуем список номеров задач: строки, без пустых, без дублей."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in ids_raw or []:
+        s = str(x).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def _parse_ocr_json(raw: str) -> tuple[str, list[str]]:
-    """Парсит JSON-ответ OCR. Устойчив к code-fence и мусору вокруг."""
+    """Парсит JSON-ответ OCR. Устойчив к code-fence, мусору, неэкранированным
+    кавычкам в LaTeX (типичная ошибка Haiku — он не экранирует " в \\text{}).
+
+    Многоступенчатый подход:
+      1) Снять markdown-обёртку ```json...```.
+      2) Попытаться json.loads(вырезанный {...} блок).
+      3) Если упал — вытащить condition и task_ids регэксами из исходного текста.
+      4) Если и это не вышло — fail: вернуть ("", []), чтобы pipeline пошёл по
+         ocr_failed-ветке и не подсунул DeepSeek-у markdown как «условие».
+    """
     text = raw.strip()
-    # снять возможную ```json ... ``` обёртку
-    text = re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", text, flags=re.IGNORECASE).strip()
-    # выдрать первый {...} блок если есть лишний текст
+    # 1) Снять markdown-обёртку, отдельными sub'ами в начале и конце.
+    text = re.sub(r"^\s*```(?:json|JSON)?\s*\n?", "", text)
+    text = re.sub(r"\n?\s*```\s*$", "", text).strip()
+
+    # 2) Жадно вырезать самый внешний {...} блок (с поддержкой DOTALL).
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if m:
-        text = m.group(0)
+    block = m.group(0) if m else text
+
     try:
-        data = json.loads(text)
-        condition = (data.get("condition") or "").strip()
-        ids_raw = data.get("task_ids") or []
-        # нормализуем: строки, без пустых, без дублей, сохраняя порядок
-        seen = set()
-        task_ids = []
-        for x in ids_raw:
-            s = str(x).strip()
-            if s and s not in seen:
-                seen.add(s)
-                task_ids.append(s)
-        return condition, task_ids
-    except Exception:
-        # не JSON — трактуем весь ответ как условие, номеров не знаем
-        return raw.strip(), []
+        data = json.loads(block)
+        return (data.get("condition") or "").strip(), _normalize_task_ids(data.get("task_ids"))
+    except json.JSONDecodeError:
+        pass
+
+    # 3) JSON битый (типично: неэкранированные " внутри LaTeX-частей). Дёргаем
+    #    regex'ом — это устойчивее на корявом выходе модели.
+    m_cond = re.search(r'"condition"\s*:\s*"(.+?)"\s*[,}]\s*(?:"task_ids"|$)', block, re.DOTALL)
+    m_ids = re.search(r'"task_ids"\s*:\s*\[(.*?)\]', block, re.DOTALL)
+    if m_cond:
+        condition = m_cond.group(1)
+        # Развернём типовые JSON-escape'ы.
+        condition = condition.replace('\\"', '"').replace('\\n', '\n').replace('\\\\', '\\').strip()
+        ids = []
+        if m_ids:
+            ids = [t for t in re.findall(r'"([^"]+)"|(\d+)', m_ids.group(1))
+                   for t in t if t]
+            ids = _normalize_task_ids(ids)
+        if condition:
+            logger.warning(
+                f"OCR JSON битый, спасли regex'ом: condition={len(condition)}ch, "
+                f"task_ids={ids}"
+            )
+            return condition, ids
+
+    # 4) Совсем ничего — fail. Pipeline воспримет как OCR-fail и
+    #    попросит юзера переснять, вместо того чтобы кормить markdown в solver.
+    logger.error(
+        f"OCR JSON неразборчив, condition не извлечён. Raw head: {raw[:300]!r}"
+    )
+    return "", []
 
 
 async def extract_condition_text(
@@ -117,10 +170,13 @@ async def extract_condition_text(
             f"Также перечисли номера всех задач на фото. Верни JSON."
         )
 
+    # vision_ocr_model — Sonnet по умолчанию. Кратно меньше галлюцинаций на матане
+    # чем у Haiku; ≈+0.6₽ за OCR, копейки относительно стоимости решения задачи.
+    model_id = settings.vision_ocr_model
     try:
         response = await client.messages.create(
-            model=settings.ocr_model,
-            max_tokens=700,
+            model=model_id,
+            max_tokens=900,
             system=OCR_SYSTEM,
             messages=[{
                 "role": "user",
@@ -138,9 +194,9 @@ async def extract_condition_text(
                 raw += block.text
         condition, task_ids = _parse_ocr_json(raw)
         logger.info(
-            f"OCR extract [{settings.ocr_model}]: in={response.usage.input_tokens}, "
+            f"OCR extract [{model_id}]: in={response.usage.input_tokens}, "
             f"out={response.usage.output_tokens}, "
-            f"≈{estimate_cost_rub(settings.ocr_model, response.usage.input_tokens, response.usage.output_tokens):.1f}₽, "
+            f"≈{estimate_cost_rub(model_id, response.usage.input_tokens, response.usage.output_tokens):.1f}₽, "
             f"len={len(condition)}, task_ids={task_ids}"
         )
         return condition, task_ids
