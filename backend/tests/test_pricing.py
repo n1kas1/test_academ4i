@@ -372,3 +372,41 @@ def test_estimated_cost_paid_mode(monkeypatch):
     avg, total = _estimated_cost_rub(20)
     assert avg == 4.0
     assert total == 80.0
+
+
+# ─────────────────── classify_topic — discrete keywords ─────────────
+
+def test_classify_discrete_automata():
+    """Задача про автомат должна определяться как discrete (раньше → matan)."""
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Постройте конечный автомат для языка L") == "discrete"
+    assert classify_topic("Сколько различных автоматов на множестве X?") == "discrete"
+
+
+def test_classify_discrete_inclusion_exclusion():
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Применяя формулу включений-исключений, найти ...") == "discrete"
+
+
+def test_classify_discrete_hamming_code():
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Декодировать слово в коде Хэмминга (7,4)") == "discrete"
+
+
+def test_classify_discrete_graph_terminology():
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Найдите хроматическое число графа G") == "discrete"
+    assert classify_topic("Существует ли паросочетание в двудольном графе") == "discrete"
+
+
+def test_classify_discrete_permutations():
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Число перестановок из 7 элементов") == "discrete"
+
+
+def test_classify_still_routes_other_topics():
+    """Sanity: расширение discrete не зацепило matan/probability."""
+    from app.ai.pipeline import classify_topic
+    assert classify_topic("Найти производную функции y = x² + 3x") == "matan"
+    assert classify_topic("Найти математическое ожидание случайной величины") == "probability"
+    assert classify_topic("Доказать, что группа G — циклическая") == "groups"
