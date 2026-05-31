@@ -61,8 +61,16 @@ async def _generate(system_prompt: str, user_text: str, *, log_tag: str) -> str:
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": {
-            "maxOutputTokens": MAX_TOKENS,
-            # temperature не задаём — дефолт Gemini Flash оптимален для математики.
+            # ВАЖНО: maxOutputTokens у Gemini 2.5 покрывает thinking + ответ.
+            # Без thinkingBudget=0 модель сжигает 3-4к токенов на reasoning,
+            # на финальный ответ остаются крохи — юзер получает огрызок.
+            # 8192 хватает на длинное доказательство, Gemini Flash без thinking
+            # выдаст это за 30-40с (а не 3 минуты как DeepSeek).
+            "maxOutputTokens": 8192,
+            # thinkingBudget=0 → отключить thinking. RAG-контекст у нас уже
+            # есть как «подсказка», thinking дополнительной пользы не даёт.
+            "thinkingConfig": {"thinkingBudget": 0},
+            # temperature не задаём — дефолт оптимален для математики.
         },
     }
     params = {"key": settings.openai_api_key}
