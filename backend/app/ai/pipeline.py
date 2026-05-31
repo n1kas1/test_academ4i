@@ -38,12 +38,34 @@ from loguru import logger
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
 from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek
+from app.ai.gemini import solve_with_gemini, solve_with_gemini_plain, fix_latex_with_gemini
 from app.ai.latex_sanitize import sanitize_for_render
 from app.render.plain_pdf import render_plain_pdf
 from app.config import settings as _settings
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 from app.render.latex_to_png import render_solution, render_verbatim
+
+
+# ── Solver router: переключаем free-mode между Gemini (быстро) и DeepSeek (медленно)
+# через settings.free_mode_solver. Так можно откатиться одним .env без редеплоя кода
+# (FREE_MODE_SOLVER=deepseek) — например если Gemini временно лагает или фильтрует.
+def _solver_solve(condition_text: str, rag_context: str = "", user_hint: str = ""):
+    if _settings.free_mode_solver == "deepseek":
+        return solve_with_deepseek(condition_text, rag_context, user_hint)
+    return solve_with_gemini(condition_text, rag_context, user_hint)
+
+
+def _solver_plain(condition_text: str, rag_context: str = "", user_hint: str = ""):
+    if _settings.free_mode_solver == "deepseek":
+        return solve_with_deepseek_plain(condition_text, rag_context, user_hint)
+    return solve_with_gemini_plain(condition_text, rag_context, user_hint)
+
+
+def _solver_fix(broken_latex: str, error_log: str):
+    if _settings.free_mode_solver == "deepseek":
+        return fix_latex_with_deepseek(broken_latex, error_log)
+    return fix_latex_with_gemini(broken_latex, error_log)
 
 
 _PLAIN_MARKERS = ("Задача:", "Решение:", "Ответ:")
@@ -87,26 +109,27 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
     if rendered["pdf"] or not rendered.get("error"):
         return rendered, latex
 
-    # ── FREE-MODE: DeepSeek-fix → DeepSeek-plain ──
+    # ── FREE-MODE: <solver>-fix → <solver>-plain ──
+    # Конкретный солвер (Gemini/DeepSeek) выбирается роутером по settings.free_mode_solver.
     if _settings.free_mode:
-        logger.warning("render failed — DeepSeek-fix LaTeX (free-mode)")
+        logger.warning(f"render failed — {_settings.free_mode_solver}-fix LaTeX (free-mode)")
         try:
-            fixed = await fix_latex_with_deepseek(latex, rendered["error"])
+            fixed = await _solver_fix(latex, rendered["error"])
             if fixed:
                 fixed = sanitize_for_render(fixed)
             if fixed and fixed.strip() != latex.strip():
                 re_rend = await render_solution(fixed)
                 if re_rend["pdf"]:
-                    logger.info("DeepSeek-fix succeeded → PDF собран")
+                    logger.info(f"{_settings.free_mode_solver}-fix succeeded → PDF собран")
                     return re_rend, fixed
         except Exception as e:
-            logger.warning(f"fix_latex_with_deepseek failed: {e}")
+            logger.warning(f"solver-fix failed: {e}")
 
         # Tier 3 — plain-формат через ReportLab. PDF будет всегда.
         if condition_text:
             logger.warning("LaTeX-путь исчерпан — переключаемся на plain-формат")
             try:
-                plain = await solve_with_deepseek_plain(condition_text)
+                plain = await _solver_plain(condition_text)
                 if plain:
                     rendered_plain = await render_plain_pdf(plain)
                     if rendered_plain.get("pdf"):
@@ -351,7 +374,7 @@ async def solve_task_from_photo(
     # Выбор солвера по режиму.
     if mode == "standard":
         await _status(on_status, "🧠 Решаю…")
-        solution_raw = await solve_with_deepseek(
+        solution_raw = await _solver_solve(
             condition_text=condition_text,
             rag_context=rag_context,
             user_hint=user_hint,
@@ -444,7 +467,7 @@ async def solve_task_from_text(
 
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
     await _status(on_status, "🧠 Решаю…")
-    solution_raw = await solve_with_deepseek(
+    solution_raw = await _solver_solve(
         condition_text=condition_text,
         rag_context=rag_context,
         user_hint=user_hint,

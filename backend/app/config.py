@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     deepseek_model: str = "openrouter/deepseek/deepseek-chat-v3.1"
     openai_compat_base_url: str = "https://openai.api.proxyapi.ru/v1"
 
+    # === Gemini 2.5 Flash — основной солвер free-mode (быстрее DeepSeek в 3-5×) ===
+    # Native Google-формат через ProxyAPI (не OpenAI-совместимый): URL вида
+    # {base}/v1beta/models/{model}:generateContent?key=<api_key>. Тот же ProxyAPI
+    # ключ что у openai (один ключ на все шлюзы ProxyAPI).
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_base_url: str = "https://api.proxyapi.ru/google"
+    # Какой солвер использовать в free-mode: "gemini" (быстро) или "deepseek" (медленно).
+    # Менять через .env (FREE_MODE_SOLVER=deepseek), без редеплоя кода — для quick rollback.
+    free_mode_solver: str = "gemini"
+
     # === Postgres ===
     database_url: str
     supabase_url: str = ""
