@@ -77,6 +77,35 @@ async def bump_daily_used(telegram_id: int, username: Optional[str] = None) -> i
     return n
 
 
+# === Per-user inflight lock (защита кошелька от ретраев юзера) ===
+#
+# Кейс: юзер шлёт задачу, не получает ответ за минуту (provider lag), шлёт
+# повторно — каждый retry это новый pipeline (haiku-gate + embedding + DeepSeek).
+# Каждый из них тратит токены даже при зависании ответа. Сейчас 5 ретраев = 5×
+# оплата. Лок per-user не пускает второй pipeline пока первый не вернулся.
+#
+# TTL подобран под worst-case: 90с DeepSeek-таймаут (см. ai/deepseek.py) + 30с
+# на render-цепочку и доставку. По завершении вызывается release_inflight()
+# в finally — лок снимается сразу.
+INFLIGHT_LOCK_TTL_SEC = 120
+
+
+async def try_acquire_inflight(telegram_id: int) -> bool:
+    """SET NX EX — атомарно захватить лок. False = у юзера уже идёт обработка."""
+    redis = get_redis()
+    ok = await redis.set(
+        f"inflight:user:{telegram_id}", "1",
+        nx=True, ex=INFLIGHT_LOCK_TTL_SEC,
+    )
+    return bool(ok)
+
+
+async def release_inflight(telegram_id: int) -> None:
+    """Снять лок сразу после завершения pipeline (успех/ошибка/таймаут — любой исход)."""
+    redis = get_redis()
+    await redis.delete(f"inflight:user:{telegram_id}")
+
+
 # === Админ-чек ===
 
 def is_admin(username: Optional[str]) -> bool:

@@ -23,8 +23,14 @@ from aiogram.types import (
 )
 from loguru import logger
 
+from anthropic import APITimeoutError as AnthropicTimeoutError, APIConnectionError as AnthropicConnError
+from openai import APITimeoutError as OpenAITimeoutError, APIConnectionError as OpenAIConnError
+
 from app.ai.pipeline import solve_task_from_photo, solve_task_from_text
 from app.ai.haiku_gate import is_math_or_physics
+
+# Все таймауты/проблемы коннекта от LLM-провайдеров — один кортеж для except.
+_LLM_TIMEOUT_EXCS = (AnthropicTimeoutError, AnthropicConnError, OpenAITimeoutError, OpenAIConnError)
 from app.bot.keyboards import (
     BTN_BALANCE,
     BTN_BUY_CREDITS,
@@ -44,12 +50,14 @@ from app.bot.messages import (
     MSG_ERROR,
     MSG_HELP_CREDITS,
     MSG_HELP_FREE,
+    MSG_INFLIGHT,
     MSG_NOT_MATH,
     MSG_OCR_FAILED_STANDARD,
     MSG_PROCESSING,
     MSG_START_CREDITS,
     MSG_START_FREE,
     MSG_TEXT_PROCESSING,
+    MSG_TIMEOUT,
     msg_balance_credits,
     msg_balance_free,
     msg_choose_task,
@@ -69,6 +77,8 @@ from app.ratelimit import (
     get_daily_used,
     get_or_create_user,
     is_admin,
+    release_inflight,
+    try_acquire_inflight,
 )
 
 router = Router()
@@ -240,12 +250,20 @@ async def _present_modes(
             if not ok:
                 await message.answer(MSG_DAILY_CAP_REACHED)
                 return
+        # Inflight-lock ставим ДО pipeline. Если юзер шлёт повторно, пока первая
+        # задача в работе — отбиваем без AI-вызовов (экономия 0.5-2₽ на retry).
+        if not await try_acquire_inflight(user.id):
+            await message.answer(MSG_INFLIGHT)
+            return
         processing_msg = await message.answer(MSG_PROCESSING)
-        await _run_solve(
-            bot, message.chat.id, processing_msg, user,
-            file_id, is_pdf, hint, mode="standard", cost=0,
-            status=CreditStatus(is_admin=adm),
-        )
+        try:
+            await _run_solve(
+                bot, message.chat.id, processing_msg, user,
+                file_id, is_pdf, hint, mode="standard", cost=0,
+                status=CreditStatus(is_admin=adm),
+            )
+        finally:
+            await release_inflight(user.id)
         return
 
     # ── CREDIT MODE ──
@@ -364,6 +382,16 @@ async def _run_solve(
             await consume_credits(user.id, cost, username=user.username)
         log_event(user.id, "solve")
 
+    except _LLM_TIMEOUT_EXCS as e:
+        # Кредиты/daily_used не списываем — провайдер не ответил, юзер не виноват.
+        logger.warning(
+            f"LLM timeout for user {user.id} (@{user.username}): "
+            f"{type(e).__name__}: {e}"
+        )
+        try:
+            await processing_msg.edit_text(MSG_TIMEOUT)
+        except Exception:
+            await bot.send_message(chat_id, MSG_TIMEOUT)
     except Exception as e:
         logger.exception(f"Pipeline error for user {user.id}: {e}")
         try:
@@ -411,6 +439,12 @@ async def handle_mode(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
         return
 
+    # Inflight-lock — защита от двойного клика «Стандарт/Премиум» (Telegram иногда
+    # дублирует callback при флапе сети). Один pipeline на юзера за раз.
+    if not await try_acquire_inflight(user.id):
+        await callback.message.answer(MSG_INFLIGHT)
+        return
+
     await get_redis().delete(f"pend:{token}")
 
     processing_msg = callback.message
@@ -419,10 +453,13 @@ async def handle_mode(callback: CallbackQuery, bot: Bot):
     except Exception:
         processing_msg = await callback.message.answer(MSG_PROCESSING)
 
-    await _run_solve(
-        bot, callback.message.chat.id, processing_msg, user,
-        data["file_id"], data.get("is_pdf", False), data.get("hint", ""), mode, cost, status,
-    )
+    try:
+        await _run_solve(
+            bot, callback.message.chat.id, processing_msg, user,
+            data["file_id"], data.get("is_pdf", False), data.get("hint", ""), mode, cost, status,
+        )
+    finally:
+        await release_inflight(user.id)
 
 
 @router.callback_query(F.data.startswith("pick:"))
@@ -474,6 +511,11 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
         return
 
+    # Inflight-lock (см. handle_mode). Защита от двойного клика на pick-кнопке.
+    if not await try_acquire_inflight(user.id):
+        await callback.message.answer(MSG_INFLIGHT)
+        return
+
     await get_redis().delete(f"taskpick:{token}")
 
     processing_msg = callback.message
@@ -483,10 +525,13 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
         processing_msg = await callback.message.answer(MSG_PROCESSING)
 
     hint = f"реши задачу №{chosen}"
-    await _run_solve(
-        bot, callback.message.chat.id, processing_msg, user,
-        file_id, is_pdf, hint, mode, cost, status,
-    )
+    try:
+        await _run_solve(
+            bot, callback.message.chat.id, processing_msg, user,
+            file_id, is_pdf, hint, mode, cost, status,
+        )
+    finally:
+        await release_inflight(user.id)
 
 
 async def _send_solution_result(
@@ -567,6 +612,12 @@ async def handle_resolve(callback: CallbackQuery, bot: Bot):
         await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
         return
 
+    # Inflight-lock: «перерешать» — тоже полный pipeline. Без лока двойной клик
+    # на кнопку = двойная оплата Sonnet.
+    if not await try_acquire_inflight(user.id):
+        await callback.answer("⏳ Дождись завершения текущего решения.", show_alert=True)
+        return
+
     await callback.answer("🔄 Перерешиваю заново…")
     await get_redis().delete(f"sol:{token}")
     try:
@@ -597,12 +648,20 @@ async def handle_resolve(callback: CallbackQuery, bot: Bot):
             caption="🔄 Готово — перерешано заново (кредиты не списаны).",
             allow_resolve=False,
         )
+    except _LLM_TIMEOUT_EXCS as e:
+        logger.warning(f"LLM timeout (resolve) for user {user.id}: {type(e).__name__}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_TIMEOUT)
+        except Exception:
+            await callback.message.answer(MSG_TIMEOUT)
     except Exception as e:
         logger.exception(f"Resolve error for user {user.id}: {e}")
         try:
             await processing_msg.edit_text(MSG_ERROR)
         except Exception:
             await callback.message.answer(MSG_ERROR)
+    finally:
+        await release_inflight(user.id)
 
 
 @router.message(F.text)
@@ -648,6 +707,12 @@ async def handle_text(message: Message, bot: Bot):
             await message.answer(MSG_NOT_MATH)
             return
 
+    # Inflight-lock: см. _present_modes. Особенно критично для текстового пути —
+    # юзер может вбивать одну задачу 5 раз подряд за минуту.
+    if not await try_acquire_inflight(user.id):
+        await message.answer(MSG_INFLIGHT)
+        return
+
     processing_msg = await message.answer(MSG_TEXT_PROCESSING)
     try:
         result = await solve_task_from_text(
@@ -667,12 +732,24 @@ async def handle_text(message: Message, bot: Bot):
         )
         await bump_daily_used(user.id, username=user.username)
         log_event(user.id, "solve")
+    except _LLM_TIMEOUT_EXCS as e:
+        # Daily_used не списываем — провайдер не ответил.
+        logger.warning(
+            f"LLM timeout (text-solve) for user {user.id} (@{user.username}): "
+            f"{type(e).__name__}: {e}"
+        )
+        try:
+            await processing_msg.edit_text(MSG_TIMEOUT)
+        except Exception:
+            await message.answer(MSG_TIMEOUT)
     except Exception as e:
         logger.exception(f"text-solve error for user {user.id}: {e}")
         try:
             await processing_msg.edit_text(MSG_ERROR)
         except Exception:
             await message.answer(MSG_ERROR)
+    finally:
+        await release_inflight(user.id)
 
 
 # ─── утилиты ──────────────────────────────────────────────────────────

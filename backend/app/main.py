@@ -9,6 +9,7 @@ Webhook от Telegram приходит на POST /webhook,
 import asyncio
 import logging
 import socket
+import sys
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher
@@ -20,9 +21,26 @@ from loguru import logger
 
 from app.config import settings
 from app.bot import admin, handlers
+from app.bot.log_middleware import UserContextMiddleware
 from app.payments import tg_stars
 from app.core.db import close_db, init_db
 from app.core.redis import close_redis, get_redis, init_redis
+
+
+# ── Loguru: формат с user-контекстом (выставляется UserContextMiddleware) ────
+# `extra` имеет дефолты "—" чтобы не падать на логах вне TG-handler'а
+# (lifespan, FastAPI, фоновые задачи без юзера).
+logger.remove()
+logger.add(
+    sys.stderr,
+    level=settings.log_level,
+    format=(
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <7} | "
+        "tg={extra[tg]} @{extra[user]} | "
+        "{name}:{function}:{line} - {message}"
+    ),
+)
+logger.configure(extra={"tg": "—", "user": "—"})
 
 # === Aiogram setup ===
 bot = Bot(
@@ -30,6 +48,11 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+# outer-middleware: вешает logger.contextualize(tg=..., user=...) на КАЖДЫЙ
+# апдейт ДО любого роутера. Дальше все логи (pipeline, claude, deepseek, render)
+# автоматически содержат tg=ID @username — грепаешь логи по юзеру одним фильтром.
+dp.update.outer_middleware(UserContextMiddleware())
+
 # payments router идёт ПЕРВЫМ — чтобы pre_checkout_query и successful_payment
 # ловились ДО обработчика photo/text сообщений
 dp.include_router(tg_stars.router)

@@ -404,12 +404,34 @@ def test_classify_discrete_permutations():
     assert classify_topic("Число перестановок из 7 элементов") == "discrete"
 
 
+def test_classify_discrete_post_basis():
+    """Постовский базис / полнота булевых функций — раньше уходило в lin_alg
+    (из-за «системы» / «функции» / «$f_1$» без булевых ключевиков).
+    Регрессия задокументированной проблемы: 31 мая, user 589625614 — DeepSeek
+    висел 13 минут без RAG-контекста, потому что topic был lin_alg."""
+    from app.ai.pipeline import classify_topic
+    cases = [
+        "Перечислите все минимальные полные подсистемы системы {f_1, f_2, f_3, f_4, f_5, f_6}",
+        "Является ли штрих Шеффера функционально полной системой?",
+        "Содержит ли система функций T₀-сохраняющую и не самодвойственную функцию?",
+        "Постройте базис Поста для следующих булевых функций",
+        "Проверить, что функция f линейна (класс T_L по Посту)",
+        "Является ли монотонной булева функция, заданная вектором значений 0011",
+        "Стрелка Пирса и её роль в полноте",
+    ]
+    for txt in cases:
+        assert classify_topic(txt) == "discrete", f"got wrong topic for: {txt!r}"
+
+
 def test_classify_still_routes_other_topics():
-    """Sanity: расширение discrete не зацепило matan/probability."""
+    """Sanity: расширение discrete не зацепило matan/probability/groups/lin_alg."""
     from app.ai.pipeline import classify_topic
     assert classify_topic("Найти производную функции y = x² + 3x") == "matan"
     assert classify_topic("Найти математическое ожидание случайной величины") == "probability"
     assert classify_topic("Доказать, что группа G — циклическая") == "groups"
+    # Линал — система ЛИНЕЙНЫХ уравнений, не «полная система функций».
+    assert classify_topic("Найти ранг матрицы и базис её ядра") == "lin_alg"
+    assert classify_topic("Решить систему линейных уравнений методом Гаусса") == "lin_alg"
 
 
 # ───────────────── prompt injection защита (wrap_task/wrap_hint) ────────

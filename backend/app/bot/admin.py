@@ -128,6 +128,22 @@ _PRODUCTS_SQL = text(
     "SELECT product, COUNT(*) AS n FROM payments WHERE status='succeeded' GROUP BY product"
 )
 
+# Топ активных юзеров за период — для связи (узнать кому проблема, кто фармит).
+# LEFT JOIN: events.telegram_id может ссылаться на юзера до того как тот залился в users
+# (race условие первой задачи). NULL username → выводим только tg-id.
+_TOP_USERS_SQL = text("""
+SELECT
+  e.telegram_id AS tg,
+  u.username    AS username,
+  COUNT(*)      AS solves
+FROM events e
+LEFT JOIN users u ON u.telegram_id = e.telegram_id
+WHERE e.type = 'solve' AND e.created_at >= :start
+GROUP BY e.telegram_id, u.username
+ORDER BY solves DESC
+LIMIT 10
+""")
+
 
 async def _render_stats(days: int) -> str:
     if days == 1:
@@ -138,10 +154,23 @@ async def _render_stats(days: int) -> str:
     async with get_session() as session:
         r = (await session.execute(_STATS_SQL, {"start": start})).one()._mapping
         products = (await session.execute(_PRODUCTS_SQL)).all()
+        top_users = (await session.execute(_TOP_USERS_SQL, {"start": start})).all()
 
     prod_lines = "\n".join(f"   • {p}: {n}" for p, n in products) or "   • —"
     avg_rub, total_rub = _estimated_cost_rub(r["solved_p"])
     mode_badge = "✨ free (DeepSeek)" if settings.free_mode else "💎 paid (DeepSeek + Sonnet)"
+
+    # Топ юзеров за период — строки: «N. tg=12345 @user — 7 задач».
+    # Если username пустой → выводим только tg-id (для связи: tg://user?id= в TG).
+    if top_users:
+        top_lines = []
+        for i, row in enumerate(top_users, 1):
+            tg, uname, solves = row.tg, row.username, row.solves
+            handle = f" @{uname}" if uname else ""
+            top_lines.append(f"   {i}. <code>{tg}</code>{handle} — <b>{solves}</b>")
+        top_block = "\n".join(top_lines)
+    else:
+        top_block = "   • —"
 
     return (
         f"📊 <b>Статистика</b> · <i>{label}</i>\n"
@@ -151,6 +180,8 @@ async def _render_stats(days: int) -> str:
         f"Всего юзеров: <b>{r['total_users']}</b>\n"
         f"Новых: <b>{r['new_p']}</b> · активных: <b>{r['active_p']}</b>\n"
         f"Решено задач: <b>{r['solved_p']}</b>\n\n"
+        "👤 <b>Топ юзеров за период</b> <i>(для связи)</i>\n"
+        f"{top_block}\n\n"
         "💸 <b>Расход (оценка ProxyAPI)</b>\n"
         f"≈ <b>{total_rub:.1f}₽</b>  <i>({avg_rub}₽/задача × {r['solved_p']})</i>\n\n"
         "🛒 <b>Воронка</b> <i>(за всё время)</i>\n"

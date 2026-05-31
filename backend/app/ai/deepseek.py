@@ -17,14 +17,26 @@ from app.ai.claude import SYSTEM_PROMPT
 
 _client: AsyncOpenAI | None = None
 
+# Жёсткий таймаут вызова DeepSeek через ProxyAPI/OpenRouter. Дефолт openai SDK
+# — 600с: при зависании шлюза юзер 10 минут ждал и уходил. 90с с запасом
+# покрывают «честный» долгий ответ (DeepSeek изредка генерит 20-30с) и при
+# залипании быстро падают в APITimeoutError → MSG_TIMEOUT в чат.
+_DEEPSEEK_TIMEOUT_SEC = 90.0
+# Ретраи openai SDK на APIConnectionError/5xx (без таймаутов!). 1 ретрай хватает
+# для краткосрочной сетевой просадки и не растягивает суммарное ожидание.
+_DEEPSEEK_MAX_RETRIES = 1
+
 # Стоимость в ₽ за 1M токенов (вход / выход). DeepSeek идёт через OpenRouter
 # (оригинал +25% OR +налоги +25% ProxyAPI) — в плоском прайсе его нет, это
 # ПЛЕЙСХОЛДЕР. Уточнить по дашборду ProxyAPI; факт виден в логах списания.
 _RUB_PER_MTOK = (30.0, 120.0)
 
-# Output-лимит. На free-mode подняли с 4096 — DeepSeek дешёвый, можно дать
-# длинные пошаговые решения без обрезов. Input не лимитируем (контекст 128К).
-MAX_TOKENS = 8192
+# Output-лимит. 16к токенов — длинные доказательства / разборы по случаям
+# вмещаются целиком, без обрезов в середине решения. Реальный расход обычно
+# 1-3к — лимит верхний потолок, платим только за фактический output.
+# DeepSeek через ProxyAPI: ≈2₽ за выдачу 16к токенов в худшем случае —
+# приемлемо в режиме промо-тестирования (см. settings.free_mode).
+MAX_TOKENS = 16384
 
 
 def get_client() -> AsyncOpenAI:
@@ -33,6 +45,8 @@ def get_client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_compat_base_url,
+            timeout=_DEEPSEEK_TIMEOUT_SEC,
+            max_retries=_DEEPSEEK_MAX_RETRIES,
         )
     return _client
 
@@ -92,6 +106,14 @@ async def solve_with_deepseek(
     client = get_client()
     user_text = _build_user_text(condition_text, rag_context, user_hint)
 
+    # Лог ДО call'а — чтобы при зависании было видно «застряло на DeepSeek»,
+    # а не «пропало после RAG». До этого фикса между retrieval и done могла
+    # быть 10-минутная тишина (дефолт-таймаут openai SDK).
+    logger.info(
+        f"DeepSeek call start [{settings.deepseek_model}]: "
+        f"user_text_len={len(user_text)}, has_rag={bool(rag_context)}"
+    )
+
     response = await client.chat.completions.create(
         model=settings.deepseek_model,
         max_tokens=MAX_TOKENS,
@@ -109,6 +131,9 @@ async def solve_with_deepseek(
         f"DeepSeek solved [{settings.deepseek_model}]: "
         f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
     )
+    if not text.strip():
+        # Пустой ответ — не пускаем дальше: иначе пустой PDF юзеру.
+        raise RuntimeError(f"DeepSeek returned empty content (in={in_tok}, out={out_tok})")
     return text.strip()
 
 
@@ -215,6 +240,7 @@ async def fix_latex_with_deepseek(broken_latex: str, error_log: str) -> str:
         f"Ошибка pdflatex:\n{(error_log or '')[-1500:]}\n\n"
         f"LaTeX-фрагмент (почини и верни целиком):\n{broken_latex}"
     )
+    logger.info(f"DeepSeek fix_latex call start [{settings.deepseek_model}]: len={len(broken_latex)}")
     response = await client.chat.completions.create(
         model=settings.deepseek_model,
         max_tokens=MAX_TOKENS,
@@ -246,6 +272,8 @@ async def solve_with_deepseek_plain(
     client = get_client()
     user_text = _build_user_text_plain(condition_text, rag_context, user_hint)
 
+    logger.info(f"DeepSeek-plain call start [{settings.deepseek_model}]: user_text_len={len(user_text)}")
+
     response = await client.chat.completions.create(
         model=settings.deepseek_model,
         max_tokens=MAX_TOKENS,
@@ -263,4 +291,6 @@ async def solve_with_deepseek_plain(
         f"DeepSeek plain-solved [{settings.deepseek_model}]: "
         f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
     )
+    if not text.strip():
+        raise RuntimeError(f"DeepSeek-plain returned empty content (in={in_tok}, out={out_tok})")
     return text.strip()
