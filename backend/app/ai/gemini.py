@@ -29,7 +29,6 @@ from app.ai.deepseek import (
     _build_user_text,
     _build_user_text_plain,
     _DS_FIX_SYSTEM,
-    MAX_TOKENS,
 )
 
 
@@ -96,17 +95,21 @@ async def _generate(system_prompt: str, user_text: str, *, log_tag: str) -> str:
 
     parts = (candidates[0].get("content") or {}).get("parts") or []
     text = "".join(p.get("text", "") for p in parts).strip()
+    finish_reason = candidates[0].get("finishReason", "?")
 
     usage = data.get("usageMetadata") or {}
     in_tok = usage.get("promptTokenCount", 0)
     out_tok = usage.get("candidatesTokenCount", 0)
     logger.info(
         f"Gemini solved [{settings.gemini_model}] ({log_tag}): "
-        f"in={in_tok}, out={out_tok}, ≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
+        f"in={in_tok}, out={out_tok}, finish={finish_reason}, "
+        f"≈{estimate_cost_rub(in_tok, out_tok):.2f}₽"
     )
 
     if not text:
-        raise RuntimeError(f"Gemini returned empty text (in={in_tok}, out={out_tok})")
+        # finishReason помогает диагностировать: MAX_TOKENS / SAFETY / RECITATION / OTHER.
+        logger.warning(f"Gemini empty text: finish={finish_reason}, in={in_tok}, out={out_tok}")
+        raise RuntimeError(f"Gemini returned empty text (finish={finish_reason})")
     return text
 
 

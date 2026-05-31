@@ -23,6 +23,7 @@ from aiogram.types import (
 )
 from loguru import logger
 
+import httpx
 from anthropic import APITimeoutError as AnthropicTimeoutError, APIConnectionError as AnthropicConnError
 from openai import APITimeoutError as OpenAITimeoutError, APIConnectionError as OpenAIConnError
 
@@ -30,7 +31,14 @@ from app.ai.pipeline import solve_task_from_photo, solve_task_from_text
 from app.ai.haiku_gate import is_math_or_physics
 
 # Все таймауты/проблемы коннекта от LLM-провайдеров — один кортеж для except.
-_LLM_TIMEOUT_EXCS = (AnthropicTimeoutError, AnthropicConnError, OpenAITimeoutError, OpenAIConnError)
+# httpx.* добавлен для Gemini-пути (он идёт мимо openai SDK, прямой httpx). Без
+# них Gemini-таймаут падает в общий `except Exception` → юзер видит MSG_ERROR
+# вместо MSG_TIMEOUT, и мониторинг провайдер-лагов теряется в шуме.
+_LLM_TIMEOUT_EXCS = (
+    AnthropicTimeoutError, AnthropicConnError,
+    OpenAITimeoutError, OpenAIConnError,
+    httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+)
 from app.bot.keyboards import (
     BTN_BALANCE,
     BTN_BUY_CREDITS,
@@ -224,6 +232,25 @@ def _make_status_cb(processing_msg: Message):
     return cb
 
 
+async def _safe_notify(processing_msg: Message | None, fallback_msg: Message, text: str) -> None:
+    """Доставить юзеру MSG_ERROR/MSG_TIMEOUT в максимально устойчивом виде.
+
+    1) Если processing_msg создан — пробуем отредактировать его.
+    2) Если processing_msg=None (упал ещё до создания) ИЛИ edit упал — шлём новое.
+    3) Если и это упало — глотаем (юзер заблочил бота / 403). Лог уже был на месте вызова.
+    """
+    if processing_msg is not None:
+        try:
+            await processing_msg.edit_text(text)
+            return
+        except Exception:
+            pass
+    try:
+        await fallback_msg.answer(text)
+    except Exception as e:
+        logger.warning(f"_safe_notify: both edit and answer failed: {e}")
+
+
 async def _present_modes(
     message: Message, bot: Bot, file_id: str, is_pdf: bool, hint: str,
 ) -> None:
@@ -255,8 +282,10 @@ async def _present_modes(
         if not await try_acquire_inflight(user.id):
             await message.answer(MSG_INFLIGHT)
             return
-        processing_msg = await message.answer(MSG_PROCESSING)
         try:
+            # MSG_PROCESSING внутри try: если Telegram упадёт (юзер заблочил бота
+            # между апдейтами / 429) — finally всё равно снимет inflight-лок.
+            processing_msg = await message.answer(MSG_PROCESSING)
             await _run_solve(
                 bot, message.chat.id, processing_msg, user,
                 file_id, is_pdf, hint, mode="standard", cost=0,
@@ -713,8 +742,11 @@ async def handle_text(message: Message, bot: Bot):
         await message.answer(MSG_INFLIGHT)
         return
 
-    processing_msg = await message.answer(MSG_TEXT_PROCESSING)
+    # Инициализируем processing_msg до try-блока на случай если message.answer упадёт
+    # внутри (Telegram 429 / юзер заблокировал) — иначе NameError в except-ветках.
+    processing_msg: Message | None = None
     try:
+        processing_msg = await message.answer(MSG_TEXT_PROCESSING)
         result = await solve_task_from_text(
             condition_text=text, user_id=user.id,
             on_status=_make_status_cb(processing_msg),
@@ -738,16 +770,10 @@ async def handle_text(message: Message, bot: Bot):
             f"LLM timeout (text-solve) for user {user.id} (@{user.username}): "
             f"{type(e).__name__}: {e}"
         )
-        try:
-            await processing_msg.edit_text(MSG_TIMEOUT)
-        except Exception:
-            await message.answer(MSG_TIMEOUT)
+        await _safe_notify(processing_msg, message, MSG_TIMEOUT)
     except Exception as e:
         logger.exception(f"text-solve error for user {user.id}: {e}")
-        try:
-            await processing_msg.edit_text(MSG_ERROR)
-        except Exception:
-            await message.answer(MSG_ERROR)
+        await _safe_notify(processing_msg, message, MSG_ERROR)
     finally:
         await release_inflight(user.id)
 

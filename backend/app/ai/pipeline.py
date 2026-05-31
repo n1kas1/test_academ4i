@@ -257,6 +257,31 @@ def _is_valid_latex(text: str) -> bool:
     return True
 
 
+# Минимальная длина «настоящего решения». Меньше — почти гарантированно огрызок:
+# - Gemini обрезанный thinking-budget'ом (видели 241 char)
+# - DeepSeek/Gemini отказ на prompt-injection (~64 char: одна строка отказа)
+# - Любой другой битый ответ
+# Реальное мат-решение пошагово — минимум 500-800 chars, обычно 1500+.
+# Под порог попадают и валидные ответы на тривиальные задачи (например «2+2=4»),
+# но кэшировать их и не нужно: дешевле решить снова, чем мусорить БД.
+_MIN_CACHEABLE_LEN = 500
+
+
+def _is_cacheable_solution(latex_clean: str) -> bool:
+    """True если решение стоит класть в БД-кэш как `source='generated'`.
+
+    Defense in depth: даже если LaTeX-маркеры валидны и render собрал PDF,
+    короткий ответ (огрызок / отказ / тривиальщина) больше навредит другим
+    юзерам через cache-hit, чем сэкономит API-вызов. Не сохраняем.
+    """
+    if not latex_clean or len(latex_clean) < _MIN_CACHEABLE_LEN:
+        return False
+    # Должен пройти проверку формата (LaTeX-маркеры или plain-структура).
+    if not _is_valid_latex(latex_clean):
+        return False
+    return True
+
+
 async def solve_task_from_photo(
     photo_bytes: bytes,
     user_id: int,
@@ -393,19 +418,25 @@ async def solve_task_from_photo(
     # сломанный LaTeX, который потом будет провоцировать дорогую цепочку фиксов.
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
 
-    # 8) Сохраняем LaTeX в кэш для будущих юзеров
-    try:
-        await save_solution(
-            task_text=condition_text,
-            task_latex=None,
-            embedding=embedding,
-            topic=topic,
-            solution_markdown=latex_clean,
-            source="generated",
-            generated_for_user=user_id,
+    # 8) Сохраняем LaTeX в кэш для будущих юзеров — только если это реально решение.
+    if _is_cacheable_solution(latex_clean):
+        try:
+            await save_solution(
+                task_text=condition_text,
+                task_latex=None,
+                embedding=embedding,
+                topic=topic,
+                solution_markdown=latex_clean,
+                source="generated",
+                generated_for_user=user_id,
+            )
+        except Exception as e:
+            logger.warning(f"save_solution failed (non-fatal): {e}")
+    else:
+        logger.warning(
+            f"skip cache save: latex={len(latex_clean)} chars too short / invalid "
+            f"(likely truncated answer or injection-refusal — not poisoning future users)"
         )
-    except Exception as e:
-        logger.warning(f"save_solution failed (non-fatal): {e}")
 
     # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого) + авто-фикс при ошибке
     await _status(on_status, "🖼 Оформляю решение…")
@@ -474,14 +505,19 @@ async def solve_task_from_text(
     )
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
 
-    try:
-        await save_solution(
-            task_text=condition_text, task_latex=None, embedding=embedding,
-            topic=topic, solution_markdown=latex_clean,
-            source="generated", generated_for_user=user_id,
+    if _is_cacheable_solution(latex_clean):
+        try:
+            await save_solution(
+                task_text=condition_text, task_latex=None, embedding=embedding,
+                topic=topic, solution_markdown=latex_clean,
+                source="generated", generated_for_user=user_id,
+            )
+        except Exception as e:
+            logger.warning(f"save_solution failed (non-fatal): {e}")
+    else:
+        logger.warning(
+            f"skip cache save (text): latex={len(latex_clean)} chars too short / invalid"
         )
-    except Exception as e:
-        logger.warning(f"save_solution failed (non-fatal): {e}")
 
     await _status(on_status, "🖼 Оформляю решение…")
     rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text)

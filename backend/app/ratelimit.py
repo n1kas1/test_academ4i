@@ -101,9 +101,18 @@ async def try_acquire_inflight(telegram_id: int) -> bool:
 
 
 async def release_inflight(telegram_id: int) -> None:
-    """Снять лок сразу после завершения pipeline (успех/ошибка/таймаут — любой исход)."""
-    redis = get_redis()
-    await redis.delete(f"inflight:user:{telegram_id}")
+    """Снять лок сразу после завершения pipeline (успех/ошибка/таймаут — любой исход).
+
+    НИКОГДА не бросает наружу: если Redis флапнёт ровно в finally — мы:
+    1) замаскируем основное исключение из try-блока (Python переплетёт chain),
+    2) оставим лок висеть до TTL=120с — юзер 2 минуты будет получать «ещё решаю»
+       при том что pipeline уже завершился.
+    Логируем и проглатываем. Лок в худшем случае истечёт сам по TTL.
+    """
+    try:
+        await get_redis().delete(f"inflight:user:{telegram_id}")
+    except Exception as e:
+        logger.warning(f"release_inflight({telegram_id}) failed (non-fatal): {e}")
 
 
 # === Админ-чек ===

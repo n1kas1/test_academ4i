@@ -1,6 +1,7 @@
 """Настройки приложения. Грузим из .env через pydantic-settings."""
 from dataclasses import dataclass
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +52,19 @@ class Settings(BaseSettings):
     # Какой солвер использовать в free-mode: "gemini" (быстро) или "deepseek" (медленно).
     # Менять через .env (FREE_MODE_SOLVER=deepseek), без редеплоя кода — для quick rollback.
     free_mode_solver: str = "gemini"
+
+    @field_validator("free_mode_solver")
+    @classmethod
+    def _check_free_mode_solver(cls, v: str) -> str:
+        """Fail-loud при typo в .env. Иначе при `FREE_MODE_SOLVER=deepseeek` (typo)
+        роутер молча уходит в Gemini — админ думает что откатил, а проблема та же."""
+        v = v.strip().lower()
+        allowed = {"gemini", "deepseek"}
+        if v not in allowed:
+            raise ValueError(
+                f"free_mode_solver must be one of {sorted(allowed)}, got '{v}'"
+            )
+        return v
 
     # === Postgres ===
     database_url: str
