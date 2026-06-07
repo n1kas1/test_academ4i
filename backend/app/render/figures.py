@@ -24,7 +24,7 @@ FIGURE_CACHE_DIR = CACHE_DIR / "figures"
 FIGURE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Инкрементировать при изменении STANDALONE_TEMPLATE — инвалидирует кэш.
-FIGURE_TEMPLATE_VERSION = "fig_v1"
+FIGURE_TEMPLATE_VERSION = "fig_v3"
 
 # Регексп для маркеров, которые расставляет модель вокруг TikZ-кода.
 FIG_RE = re.compile(r"%%FIG\s*(.*?)%%ENDFIG", re.DOTALL)
@@ -36,9 +36,11 @@ STANDALONE_TEMPLATE = r"""\documentclass[border=4pt]{standalone}
 \usepackage[russian]{babel}
 \usepackage{amsmath,amssymb}
 \usepackage{tikz}
+\usepackage{circuitikz}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
-\usetikzlibrary{arrows.meta,positioning,calc,patterns,shapes.geometric,shapes.misc,circuits.logic.IEC,automata,decorations.pathmorphing}
+\usepgfplotslibrary{fillbetween}
+\usetikzlibrary{arrows.meta,positioning,calc,patterns,shapes.geometric,shapes.misc,circuits.logic.IEC,automata,decorations.pathmorphing,intersections,angles,quotes,through,backgrounds}
 \begin{document}
 %CONTENT%
 \end{document}

@@ -137,11 +137,11 @@ async def solve_with_gemini_plain(
 
 
 async def generate_figure_with_gemini(
-    condition_text: str, user_hint: str = "", solution_excerpt: str = ""
+    condition_text: str, user_hint: str = "", solution_excerpt: str = "", error: str = ""
 ) -> str:
     """Сгенерировать ТОЛЬКО рисунок через Gemini. Возвращает %%FIG-блок или ''.
     Зеркалит generate_figure_with_deepseek (общий промпт/хелперы из deepseek.py)."""
-    user_text = _build_figure_user_text(condition_text, user_hint, solution_excerpt)
+    user_text = _build_figure_user_text(condition_text, user_hint, solution_excerpt, error)
     out = await _generate(FIGURE_SYSTEM_PROMPT, user_text, log_tag="figure")
     return _extract_fig_block(out)
 

@@ -41,7 +41,7 @@ from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_
 from app.ai.gemini import solve_with_gemini, solve_with_gemini_plain, fix_latex_with_gemini, generate_figure_with_gemini
 from app.ai.latex_sanitize import sanitize_for_render, detect_latex_issues
 from app.render.plain_pdf import render_plain_pdf
-from app.render.figures import render_figures_in_latex, FIG_RE
+from app.render.figures import render_figures_in_latex, compile_figure, FIG_RE
 from app.config import settings as _settings
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
@@ -70,20 +70,39 @@ def _solver_fix(broken_latex: str, error_log: str):
     return fix_latex_with_gemini(broken_latex, error_log)
 
 
-def _solver_figure(condition_text: str, user_hint: str = "", solution_excerpt: str = ""):
+def _solver_figure(condition_text: str, user_hint: str = "", solution_excerpt: str = "", error: str = ""):
     if _settings.free_mode_solver == "deepseek":
-        return generate_figure_with_deepseek(condition_text, user_hint, solution_excerpt)
-    return generate_figure_with_gemini(condition_text, user_hint, solution_excerpt)
+        return generate_figure_with_deepseek(condition_text, user_hint, solution_excerpt, error)
+    return generate_figure_with_gemini(condition_text, user_hint, solution_excerpt, error)
 
 
-# Юзер ЯВНО просит рисунок (в caption к фото или в тексте). Триггеры — глаголы
-# рисования + «график». При срабатывании рисунок становится ОБЯЗАТЕЛЬНЫМ: если
-# солвер его не вставил, догенерируем отдельным узким вызовом (_ensure_figure).
+# Юзер ЯВНО просит рисунок (в caption к фото или в тексте).
 _FIG_REQUEST_KW = (
     "нарису", "нарисов", "график", "изобраз", "начерт", "диаграмм", "чертёж", "чертеж",
     "построить график", "постройте график", "построй график", "схему", "схема",
     "plot", "graph",
 )
+
+# Авто-триггер «задаче НУЖЕН рисунок» по теме+содержанию (даже без явной просьбы) —
+# цель: рисунки появляются всегда, где это уместно. Ключи специфичны, чтобы не
+# форсить рисунок там, где он не нужен (напр. «найти производную»).
+_FIG_NEEDED_BY_TOPIC: dict[str, tuple[str, ...]] = {
+    "probability": ("плотност", "распределени", "гистограмм", "многоугольник распределени"),
+    "matan": (
+        "график", "исследова", "построить график", "постройте график", "площад",
+        "касательн", "экстремум", "асимптот", "выпукл", "перегиб", "монотонн",
+        "наибольшее и наименьшее", "фигур", "ограниченн лини",
+    ),
+    "physics": (
+        "сил", "наклонн", "плоскост", "цеп", "контур", "кабел", "проводник", "линз",
+        "луч", "зеркал", "волн", "маятник", "блок", "пружин", "траектори", "колеба",
+        "падает", "брошен", "вектор", "схем",
+    ),
+    "discrete": (
+        "граф", "дерев", "автомат", "схем", "функциональн", "вершин", "рёбр", "ребр",
+        "орграф", "диаграмм", "гамильтон", "эйлер", "паросочет",
+    ),
+}
 
 
 def _user_wants_figure(condition_text: str, user_hint: str = "") -> bool:
@@ -91,22 +110,46 @@ def _user_wants_figure(condition_text: str, user_hint: str = "") -> bool:
     return any(k in blob for k in _FIG_REQUEST_KW)
 
 
-async def _ensure_figure(latex_clean: str, condition_text: str, user_hint: str = "") -> str:
-    """Гарантия рисунка по явной просьбе юзера. Если просил и солвер НЕ вставил
-    %%FIG — догенерируем отдельным целевым вызовом и дописываем блок в решение."""
-    if not _user_wants_figure(condition_text, user_hint):
-        return latex_clean
+def _task_needs_figure(condition_text: str, user_hint: str, topic: str) -> bool:
+    """Нужен ли рисунок: явная просьба ИЛИ содержательный маркер по теме."""
+    if _user_wants_figure(condition_text, user_hint):
+        return True
+    blob = f"{condition_text} {user_hint}".lower()
+    return any(k in blob for k in _FIG_NEEDED_BY_TOPIC.get(topic, ()))
+
+
+_FIGURE_GEN_ATTEMPTS = 3  # попыток сгенерировать КОМПИЛИРУЕМЫЙ рисунок (figure-вызов дёшев)
+
+
+async def _ensure_figure(
+    latex_clean: str, condition_text: str, user_hint: str, topic: str
+) -> str:
+    """Гарантия рисунка там, где он нужен. Если задача требует рисунка
+    (_task_needs_figure), а солвер %%FIG не вставил — генерируем отдельным узким
+    вызовом, ВАЛИДИРУЕМ компиляцией и ретраим с фидбэком ошибки. В решение
+    дописываем только рисунок, который реально собрался (иначе не мусорим)."""
     if FIG_RE.search(latex_clean):
-        return latex_clean  # модель уже вставила рисунок — ничего не делаем
-    try:
-        fig = await _solver_figure(condition_text, user_hint, latex_clean[:1500])
-    except Exception as e:
-        logger.warning(f"forced figure generation failed: {e}")
+        return latex_clean  # солвер уже вставил рисунок
+    if not _task_needs_figure(condition_text, user_hint, topic):
         return latex_clean
-    if fig and FIG_RE.search(fig):
-        logger.info("figure: добавлен принудительно (юзер просил рисунок, солвер не вставил)")
-        return latex_clean.rstrip() + "\n\n" + fig + "\n"
-    logger.warning("forced figure: модель не вернула валидный %%FIG-блок")
+    err = ""
+    for attempt in range(_FIGURE_GEN_ATTEMPTS):
+        try:
+            fig = await _solver_figure(condition_text, user_hint, latex_clean[:1500], err)
+        except Exception as e:
+            logger.warning(f"forced figure gen failed (попытка {attempt + 1}): {e}")
+            break
+        m = FIG_RE.search(fig or "")
+        if not m:
+            logger.warning(f"forced figure: пустой/невалидный ответ (попытка {attempt + 1})")
+            continue
+        # Валидируем компиляцией СРАЗУ (downstream render переиспользует кэш PNG).
+        png = await compile_figure(m.group(1))
+        if png:
+            logger.info(f"figure: добавлен принудительно и собран (попытка {attempt + 1}, topic={topic})")
+            return latex_clean.rstrip() + "\n\n" + fig + "\n"
+        err = "рисунок не скомпилировался (pgfplots/tikz). Используй только числовые координаты."
+    logger.warning(f"forced figure: не удалось получить компилируемый рисунок за {_FIGURE_GEN_ATTEMPTS} попыток")
     return latex_clean
 
 
@@ -469,6 +512,7 @@ async def solve_task_from_photo(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
+            cached_latex = await _ensure_figure(cached_latex, condition_text, user_hint, topic)
             rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text, telegram_id=user_id)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
         else:
@@ -502,7 +546,7 @@ async def solve_task_from_photo(
     # сломанный LaTeX, который потом будет провоцировать дорогую цепочку фиксов.
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
     # Гарантия рисунка, если юзер ЯВНО просил (модель часто игнорит просьбу).
-    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint)
+    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint, topic)
 
     # 8) Сохраняем LaTeX в кэш для будущих юзеров — только если это реально решение.
     if _is_cacheable_solution(latex_clean):
@@ -580,6 +624,7 @@ async def solve_task_from_text(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
+            cached_latex = await _ensure_figure(cached_latex, condition_text, user_hint, topic)
             rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text, telegram_id=user_id)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
@@ -592,7 +637,7 @@ async def solve_task_from_text(
     )
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
     # Гарантия рисунка, если юзер ЯВНО просил (модель часто игнорит просьбу).
-    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint)
+    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint, topic)
 
     if _is_cacheable_solution(latex_clean):
         try:
