@@ -209,9 +209,11 @@ def _content_hash(latex: str) -> str:
 PREVIEW_DPI = 300
 
 # Без -halt-on-error pdflatex восстанавливается после нефатальных ошибок и всё
-# равно отдаёт PDF (лучше plain-фолбэка). Но если ошибок МНОГО — документ
-# покорёжен, лучше отдать в fix-chain. Порог подобран консервативно.
-_MAX_RECOVERABLE_TEX_ERRORS = 6
+# равно отдаёт PDF — это почти всегда ЛУЧШЕ plain-фолбэка (сохраняется вёрстка
+# + вставленный рисунок). Поэтому порог высокий: отдаём recovered-PDF как есть,
+# в fix-chain уходим только при ЯВНОМ мусоре (десятки ошибок). Раньше порог был
+# 6 — годный 5-страничный PDF выбрасывался в уродливый plain (и терял рисунок).
+_MAX_RECOVERABLE_TEX_ERRORS = 25
 
 
 def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
