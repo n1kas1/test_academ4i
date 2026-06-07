@@ -98,7 +98,7 @@ class Settings(BaseSettings):
 
     # === Credit-based pricing (новая модель) ===
     # Вес режимов — сколько кредитов списывается за одно решение.
-    standard_cost: int = 1      # DeepSeek v3.1 (текст после Haiku-OCR)
+    standard_cost: int = 1      # credit-mode standard; solver роутится по free_mode_solver (default Gemini)
     premium_cost: int = 10      # Sonnet 4.6 + extended thinking (vision)
     trial_credits: int = 5      # начисляется новому юзеру при первом /start
 
