@@ -106,6 +106,29 @@ class TestRenderFiguresInLatex:
         # Само решение (вне блока) уцелело.
         assert r"\hd{Решение}" in out and r"\ans{x}" in out
 
+    def test_sanitize_strips_caption(self):
+        # Реальная причина падений: модель добавляет \caption → в standalone фатально.
+        body = r"\begin{tikzpicture}\node{A};\end{tikzpicture}\caption{$A_2$}"
+        out = figures._sanitize_figure_body(body)
+        assert "caption" not in out and "tikzpicture" in out
+
+    def test_sanitize_strips_figure_wrappers(self):
+        body = (r"\begin{figure}[h]\centering"
+                r"\begin{tikzpicture}\draw(0,0)--(1,1);\end{tikzpicture}"
+                r"\caption{x}\label{fig:1}\end{figure}")
+        out = figures._sanitize_figure_body(body)
+        for bad in (r"\begin{figure}", r"\end{figure}", r"\centering", r"\caption", r"\label"):
+            assert bad not in out
+        assert r"\begin{tikzpicture}" in out and r"\draw(0,0)--(1,1)" in out
+
+    def test_sanitize_keeps_clean_body(self):
+        body = r"\begin{tikzpicture}\draw(0,0) circle(1);\end{tikzpicture}"
+        assert figures._sanitize_figure_body(body) == body
+
+    def test_sanitize_does_not_eat_similar_command(self):
+        # \drawlabel не должен ловиться как \label (нет '\' прямо перед 'label').
+        assert figures._sanitize_figure_body(r"\drawlabel{x}") == r"\drawlabel{x}"
+
     def test_mixed_success_and_failure(self, monkeypatch):
         calls = {"n": 0}
 

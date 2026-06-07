@@ -45,6 +45,59 @@ STANDALONE_TEMPLATE = r"""\documentclass[border=4pt]{standalone}
 """
 
 
+# ── Очистка тела рисунка от float-обёрток ────────────────────────────────────
+# Модель часто оборачивает TikZ в \begin{figure}/\caption/\label/\centering.
+# В standalone-документе \caption ВНЕ float → фатальная ошибка → нет PDF.
+# Срезаем эти обёртки детерминированно (по логам — реальная причина падений).
+
+def _remove_cmd_with_arg(text: str, cmd: str) -> str:
+    r"""Удалить все вхождения \cmd[..]{..} с балансировкой скобок (\caption, \label)."""
+    needle = "\\" + cmd
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        j = text.find(needle, i)
+        if j == -1:
+            out.append(text[i:])
+            break
+        # не цепляем более длинные команды (\labelfoo) — следующий символ не буква
+        nxt = j + len(needle)
+        if nxt < n and text[nxt].isalpha():
+            out.append(text[i:nxt])
+            i = nxt
+            continue
+        out.append(text[i:j])
+        k = nxt
+        if k < n and text[k] == "*":
+            k += 1
+        while k < n and text[k] in " \t":
+            k += 1
+        if k < n and text[k] == "[":  # опциональный [..]
+            depth, k = 1, k + 1
+            while k < n and depth:
+                depth += (text[k] == "[") - (text[k] == "]")
+                k += 1
+        while k < n and text[k] in " \t\n":
+            k += 1
+        if k < n and text[k] == "{":  # обязательный {..}
+            depth, k = 1, k + 1
+            while k < n and depth:
+                depth += (text[k] == "{") - (text[k] == "}")
+                k += 1
+        i = k
+    return "".join(out)
+
+
+def _sanitize_figure_body(body: str) -> str:
+    r"""Снять float-обёртки: \begin{figure}/\end{figure}/\centering/\caption{}/\label{}."""
+    body = re.sub(r"\\begin\{figure\*?\}(\[[^\]]*\])?", "", body)
+    body = re.sub(r"\\end\{figure\*?\}", "", body)
+    body = re.sub(r"\\centering\b", "", body)
+    body = _remove_cmd_with_arg(body, "caption")
+    body = _remove_cmd_with_arg(body, "label")
+    return body.strip()
+
+
 # ── Хэш ─────────────────────────────────────────────────────────────────────
 
 def _figure_hash(tikz_body: str) -> str:
@@ -144,6 +197,7 @@ async def compile_figure(tikz_body: str) -> Path | None:
     Returns:
         Абсолютный Path к PNG-файлу или None при ошибке компиляции.
     """
+    tikz_body = _sanitize_figure_body(tikz_body)  # снять float-обёртки (\caption и пр.)
     h = _figure_hash(tikz_body)
     out_png = FIGURE_CACHE_DIR / f"{h}.png"
 
