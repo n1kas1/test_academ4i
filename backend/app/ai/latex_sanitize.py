@@ -217,11 +217,60 @@ def wrap_cyrillic_in_math(text: str) -> str:
     return text
 
 
+# ─────────────────── Детектор проблем (для инструментации) ────────────
+
+# Литеральные Unicode-символы, которые под T2A фатальны без маппинга в шаблоне
+# (греческий блок, математические операторы/стрелки/буквоподобные, доп. операторы).
+# Шаблон (latex_to_png.LATEX_TEMPLATE) их перехватывает через \newunicodechar —
+# но если символ всё-таки не в карте, это сигнал для разбора падений.
+_LITERAL_UNICODE_RE = re.compile(
+    "["
+    "Ͱ-Ͽ"    # Greek
+    "⁰-₟"    # super/subscripts
+    "℀-⅏"    # letterlike (ℝ ℕ …)
+    "←-⇿"    # arrows
+    "∀-⋿"    # math operators
+    "⨀-⫿"    # supplemental math operators
+    "±×÷°"  # ± × ÷ °
+    "]"
+)
+
+
+def detect_latex_issues(latex: str) -> list[str]:
+    """Эвристически метит потенциально фатальные проблемы LaTeX. НЕ мутирует —
+    только для инструментации (таблица render_failures), чтобы видеть РЕАЛЬНОЕ
+    распределение причин падений, а не гадать.
+
+    Теги: odd_dollars / brace_mismatch / literal_unicode / emoji.
+    """
+    if not latex:
+        return []
+    issues: list[str] = []
+    # Нечётное число одиночных $ (после снятия экранированных \$ и парных $$).
+    tmp = latex.replace(r"\$", "").replace("$$", "")
+    if tmp.count("$") % 2 == 1:
+        issues.append("odd_dollars")
+    # Дисбаланс {} (игнорируя экранированные \{ \}).
+    no_esc = re.sub(r"\\[{}]", "", latex)
+    if no_esc.count("{") != no_esc.count("}"):
+        issues.append("brace_mismatch")
+    if _LITERAL_UNICODE_RE.search(latex):
+        issues.append("literal_unicode")
+    if _EMOJI_RE.search(latex):
+        issues.append("emoji")
+    return issues
+
+
 # ─────────────────── Главная функция ──────────────────────────────────
 
 
 def sanitize_for_render(latex: str) -> str:
-    """Все детерминированные фиксы, в правильном порядке. Идемпотентна."""
+    """Все детерминированные фиксы, в правильном порядке. Идемпотентна.
+
+    Примечание: маппинг литерального Unicode (≤ ∫ α …) делается НЕ здесь, а в
+    LaTeX-шаблоне через \\newunicodechar — так надёжнее: покрывает символы в любом
+    контексте, включая \\text{...}, без хрупких строковых замен.
+    """
     if not latex:
         return latex
     out = latex

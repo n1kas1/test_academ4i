@@ -21,7 +21,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
-TEMPLATE_VERSION = "v8"
+TEMPLATE_VERSION = "v9"
 
 # Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
 # высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
@@ -32,9 +32,14 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[russian]{babel}
 \usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
 \usepackage{mathrsfs}  % \mathscr — сигма-алгебры/нотация тервера (часто у Claude)
+\usepackage{bm}        % \bm — жирные символы (модель часто использует)
+\usepackage{cancel}    % \cancel — зачёркивание в выкладках
+\usepackage{siunitx}   % \si/\SI — единицы СИ (физика)
+\usepackage{graphicx}  % \includegraphics — вставка отрендеренных рисунков (figures.py)
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
+\usepackage{newunicodechar}
 \geometry{paperwidth=16cm,paperheight=22cm,margin=0.6cm,top=0.8cm,bottom=0.8cm}
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
@@ -44,6 +49,122 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 % более свободные переносы (\sloppy), чтобы текст не вылезал за край.
 \setlength{\emergencystretch}{3em}
 \sloppy
+
+% ── Карта литеральных Unicode-символов → корректные LaTeX-команды. ──────────
+% Модели часто вставляют символы напрямую (≤ ∫ → ∞ ℝ α …). Под T2A без этой
+% карты они фатальны («Unicode character not allowed»). \ensuremath работает и
+% в text-, и в math-режиме. Это детерминированно убирает целый класс падений.
+\newunicodechar{≤}{\ensuremath{\le}}
+\newunicodechar{≥}{\ensuremath{\ge}}
+\newunicodechar{≠}{\ensuremath{\ne}}
+\newunicodechar{≈}{\ensuremath{\approx}}
+\newunicodechar{≡}{\ensuremath{\equiv}}
+\newunicodechar{≅}{\ensuremath{\cong}}
+\newunicodechar{≃}{\ensuremath{\simeq}}
+\newunicodechar{∼}{\ensuremath{\sim}}
+\newunicodechar{±}{\ensuremath{\pm}}
+\newunicodechar{∓}{\ensuremath{\mp}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{÷}{\ensuremath{\div}}
+\newunicodechar{·}{\ensuremath{\cdot}}
+\newunicodechar{∘}{\ensuremath{\circ}}
+\newunicodechar{∗}{\ensuremath{\ast}}
+\newunicodechar{∝}{\ensuremath{\propto}}
+\newunicodechar{→}{\ensuremath{\to}}
+\newunicodechar{←}{\ensuremath{\leftarrow}}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{⇒}{\ensuremath{\Rightarrow}}
+\newunicodechar{⇐}{\ensuremath{\Leftarrow}}
+\newunicodechar{⇔}{\ensuremath{\Leftrightarrow}}
+\newunicodechar{↦}{\ensuremath{\mapsto}}
+\newunicodechar{∞}{\ensuremath{\infty}}
+\newunicodechar{∂}{\ensuremath{\partial}}
+\newunicodechar{∇}{\ensuremath{\nabla}}
+\newunicodechar{∫}{\ensuremath{\int}}
+\newunicodechar{∮}{\ensuremath{\oint}}
+\newunicodechar{∑}{\ensuremath{\sum}}
+\newunicodechar{∏}{\ensuremath{\prod}}
+\newunicodechar{√}{\ensuremath{\surd}}
+\newunicodechar{∈}{\ensuremath{\in}}
+\newunicodechar{∉}{\ensuremath{\notin}}
+\newunicodechar{∋}{\ensuremath{\ni}}
+\newunicodechar{⊂}{\ensuremath{\subset}}
+\newunicodechar{⊆}{\ensuremath{\subseteq}}
+\newunicodechar{⊃}{\ensuremath{\supset}}
+\newunicodechar{⊇}{\ensuremath{\supseteq}}
+\newunicodechar{∪}{\ensuremath{\cup}}
+\newunicodechar{∩}{\ensuremath{\cap}}
+\newunicodechar{∅}{\ensuremath{\varnothing}}
+\newunicodechar{∀}{\ensuremath{\forall}}
+\newunicodechar{∃}{\ensuremath{\exists}}
+\newunicodechar{∄}{\ensuremath{\nexists}}
+\newunicodechar{¬}{\ensuremath{\neg}}
+\newunicodechar{∧}{\ensuremath{\wedge}}
+\newunicodechar{∨}{\ensuremath{\vee}}
+\newunicodechar{⊕}{\ensuremath{\oplus}}
+\newunicodechar{⊗}{\ensuremath{\otimes}}
+\newunicodechar{∣}{\ensuremath{\mid}}
+\newunicodechar{∥}{\ensuremath{\parallel}}
+\newunicodechar{⊥}{\ensuremath{\perp}}
+\newunicodechar{∠}{\ensuremath{\angle}}
+\newunicodechar{°}{\ensuremath{^\circ}}
+\newunicodechar{′}{\ensuremath{{}^\prime}}
+\newunicodechar{…}{\ensuremath{\ldots}}
+\newunicodechar{⋯}{\ensuremath{\cdots}}
+\newunicodechar{⟨}{\ensuremath{\langle}}
+\newunicodechar{⟩}{\ensuremath{\rangle}}
+\newunicodechar{ℝ}{\ensuremath{\mathbb{R}}}
+\newunicodechar{ℕ}{\ensuremath{\mathbb{N}}}
+\newunicodechar{ℤ}{\ensuremath{\mathbb{Z}}}
+\newunicodechar{ℚ}{\ensuremath{\mathbb{Q}}}
+\newunicodechar{ℂ}{\ensuremath{\mathbb{C}}}
+\newunicodechar{α}{\ensuremath{\alpha}}
+\newunicodechar{β}{\ensuremath{\beta}}
+\newunicodechar{γ}{\ensuremath{\gamma}}
+\newunicodechar{δ}{\ensuremath{\delta}}
+\newunicodechar{ε}{\ensuremath{\varepsilon}}
+\newunicodechar{ζ}{\ensuremath{\zeta}}
+\newunicodechar{η}{\ensuremath{\eta}}
+\newunicodechar{θ}{\ensuremath{\theta}}
+\newunicodechar{κ}{\ensuremath{\kappa}}
+\newunicodechar{λ}{\ensuremath{\lambda}}
+\newunicodechar{μ}{\ensuremath{\mu}}
+\newunicodechar{ν}{\ensuremath{\nu}}
+\newunicodechar{ξ}{\ensuremath{\xi}}
+\newunicodechar{π}{\ensuremath{\pi}}
+\newunicodechar{ρ}{\ensuremath{\rho}}
+\newunicodechar{σ}{\ensuremath{\sigma}}
+\newunicodechar{τ}{\ensuremath{\tau}}
+\newunicodechar{φ}{\ensuremath{\varphi}}
+\newunicodechar{χ}{\ensuremath{\chi}}
+\newunicodechar{ψ}{\ensuremath{\psi}}
+\newunicodechar{ω}{\ensuremath{\omega}}
+\newunicodechar{Δ}{\ensuremath{\Delta}}
+\newunicodechar{Γ}{\ensuremath{\Gamma}}
+\newunicodechar{Θ}{\ensuremath{\Theta}}
+\newunicodechar{Λ}{\ensuremath{\Lambda}}
+\newunicodechar{Ξ}{\ensuremath{\Xi}}
+\newunicodechar{Π}{\ensuremath{\Pi}}
+\newunicodechar{Σ}{\ensuremath{\Sigma}}
+\newunicodechar{Φ}{\ensuremath{\Phi}}
+\newunicodechar{Ψ}{\ensuremath{\Psi}}
+\newunicodechar{Ω}{\ensuremath{\Omega}}
+
+% ── Страховка от галлюцинируемых команд (не из подключённых пакетов). ───────
+% \providecommand определяет ТОЛЬКО если команда ещё не существует — не ломает
+% уже определённые. Без этого «\R», «\abs» и т.п. → «undefined control sequence».
+\providecommand{\R}{\mathbb{R}}
+\providecommand{\N}{\mathbb{N}}
+\providecommand{\Z}{\mathbb{Z}}
+\providecommand{\Q}{\mathbb{Q}}
+\providecommand{\C}{\mathbb{C}}
+\providecommand{\abs}[1]{\left|#1\right|}
+\providecommand{\norm}[1]{\left\|#1\right\|}
+\providecommand{\sgn}{\operatorname{sgn}}
+\providecommand{\rank}{\operatorname{rank}}
+\providecommand{\tr}{\operatorname{tr}}
+\providecommand{\diag}{\operatorname{diag}}
+\providecommand{\degree}{^\circ}
 
 \definecolor{accent}{HTML}{1d4ed8}
 \definecolor{accentline}{HTML}{a5b4fc}
@@ -87,6 +208,11 @@ def _content_hash(latex: str) -> str:
 # DPI превью первой страницы (выше = чётче формулы; 300 ≈ 1654px по ширине 14см).
 PREVIEW_DPI = 300
 
+# Без -halt-on-error pdflatex восстанавливается после нефатальных ошибок и всё
+# равно отдаёт PDF (лучше plain-фолбэка). Но если ошибок МНОГО — документ
+# покорёжен, лучше отдать в fix-chain. Порог подобран консервативно.
+_MAX_RECOVERABLE_TEX_ERRORS = 6
+
 
 def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
     """Синхронно: latex → pdflatex → PDF + PNG-превью первой страницы.
@@ -101,9 +227,11 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[boo
         tex_path.write_text(full_doc, encoding="utf-8")
 
         # 1) pdflatex. -no-shell-escape — контент идёт от LLM, отключаем \write18.
+        # НЕТ -halt-on-error: nonstopmode восстанавливается после нефатальных
+        # ошибок и всё равно отдаёт PDF — это лучше «уродливого» plain-фолбэка.
         try:
             res = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                ["pdflatex", "-interaction=nonstopmode",
                  "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
                 # errors="replace": лог pdflatex может содержать не-UTF-8 байты
                 # (cp1251/T2A в предупреждениях) — строгий декод иначе роняет рендер.
@@ -114,10 +242,23 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[boo
             return False, "pdflatex timeout"
 
         pdf_path = tmp / "doc.pdf"
+        log = res.stdout or ""
+        # Каждая ошибка TeX начинается со строки "! ..." — считаем их.
+        n_errors = log.count("\n! ")
         if not pdf_path.exists():
-            tail = (res.stdout or "")[-1200:]
-            logger.error(f"pdflatex failed:\n{tail}")
+            tail = log[-1200:]
+            logger.error(f"pdflatex produced no PDF:\n{tail}")
             return False, tail
+        # PDF есть, но если ошибок много — документ покорёжен, лучше в fix-chain.
+        if n_errors >= _MAX_RECOVERABLE_TEX_ERRORS:
+            tail = log[-1200:]
+            logger.warning(
+                f"pdflatex recovered with {n_errors} errors "
+                f"(≥{_MAX_RECOVERABLE_TEX_ERRORS}) — отдаём в fix-chain"
+            )
+            return False, tail
+        if n_errors:
+            logger.warning(f"pdflatex отдал PDF с {n_errors} восстановленной(ыми) ошибкой(ами)")
 
         out_pdf.parent.mkdir(parents=True, exist_ok=True)
         out_pdf.write_bytes(pdf_path.read_bytes())

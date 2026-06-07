@@ -4,7 +4,9 @@
 импортируемость app.* без .env и без mkdir('/app/render_cache') в latex_to_png.
 """
 import os
+import pathlib
 import sys
+import tempfile
 import types
 
 # Dummy-env (env-vars приоритетнее .env у pydantic-settings) — Settings() сконструируется.
@@ -24,6 +26,11 @@ async def _noop_render(*_a, **_k):
 
 _stub.render_solution = _noop_render
 _stub.render_verbatim = _noop_render  # бронебойный fallback в pipeline
+# app.render.figures импортит эти имена из latex_to_png — отдаём безопасные заглушки
+# (tmp-кэш, identity-trim), чтобы РЕАЛЬНЫЙ figures.py импортировался и тестировался.
+_stub.CACHE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="render_cache_test_"))
+_stub.PREVIEW_DPI = 300
+_stub._trim_white = lambda b, *a, **k: b
 sys.modules.setdefault("app.render.latex_to_png", _stub)
 
 # Заглушка plain_pdf (free-mode рендер через ReportLab) — в тестах не нужна реально.

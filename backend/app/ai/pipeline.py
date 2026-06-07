@@ -39,12 +39,14 @@ from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
 from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek
 from app.ai.gemini import solve_with_gemini, solve_with_gemini_plain, fix_latex_with_gemini
-from app.ai.latex_sanitize import sanitize_for_render
+from app.ai.latex_sanitize import sanitize_for_render, detect_latex_issues
 from app.render.plain_pdf import render_plain_pdf
+from app.render.figures import render_figures_in_latex, FIG_RE
 from app.config import settings as _settings
 from app.ai.embeddings import embed_text
 from app.ai.retrieval import find_similar_solutions, save_solution, increment_usage
 from app.render.latex_to_png import render_solution, render_verbatim
+from app.analytics import log_event
 
 
 # ── Solver router: переключаем free-mode между Gemini (быстро) и DeepSeek (медленно)
@@ -82,16 +84,27 @@ def _is_plain_format(text: str) -> bool:
     return any(m in text for m in _PLAIN_MARKERS)
 
 
-async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[dict, str]:
+_FREE_FIX_ATTEMPTS = 2  # сколько раз пытаемся починить LaTeX моделью до plain-фолбэка
+
+
+async def _render_with_autofix(
+    latex: str, condition_text: str = "", telegram_id: int = 0
+) -> tuple[dict, str]:
     """Гарантированный рендер PDF с авто-фиксами.
 
     free_mode (дешёвый путь):
       0) если контент уже plain — сразу ReportLab PDF.
-      1) основной LaTeX-рендер (pdflatex).
-      2) DeepSeek-fix LaTeX по логу ошибки → re-render.
-      3) DeepSeek-plain (тот же DeepSeek, другой системный промпт) → ReportLab PDF.
+      0.5) %%FIG-блоки → изолированная компиляция TikZ → \\includegraphics
+           (ошибка рисунка не роняет решение — блок молча убирается).
+      1) основной LaTeX-рендер (pdflatex, без -halt-on-error: одна ошибка не
+         убивает весь документ).
+      2) solver-fix LaTeX по логу ошибки → re-render (до _FREE_FIX_ATTEMPTS попыток).
+      3) solver-plain (другой системный промпт) → ReportLab PDF.
     paid_mode (дорогой путь, использовался ранее):
       Haiku-fix → Sonnet-fix → verbatim.
+
+    Метрики тиров пишутся через log_event (events.props) — видно частоту фолбэка
+    и реальные причины падений (issues + дамп LaTeX) для последующей доводки.
 
     Sanitize применяется ВНУТРИ этой функции — покрывает все вызовы:
     cache-hit (старые записи в БД), pipeline cache-miss, OCR-fallback,
@@ -99,31 +112,60 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
     """
     latex = sanitize_for_render(latex)
 
-    # Free-mode короткий путь: уже plain → ReportLab.
+    # Free-mode короткий путь: уже plain → ReportLab (рисунки plain не поддерживает).
     if _settings.free_mode and _is_plain_format(latex):
         rendered = await render_plain_pdf(latex)
         return rendered, latex
 
+    # Рисунки: %%FIG-блоки компилируем изолированно → \includegraphics. Ошибка
+    # отдельного рисунка не должна ронять всё решение (он молча опускается).
+    try:
+        latex, fig_ok, fig_failed = await render_figures_in_latex(latex)
+        if fig_ok or fig_failed:
+            logger.info(f"figures embedded: {fig_ok} ok / {fig_failed} failed")
+            if fig_failed:
+                log_event(telegram_id, "render_figure_fail", ok=fig_ok, failed=fig_failed)
+    except Exception as e:
+        logger.warning(f"figure preprocessing failed (non-fatal): {e}")
+        latex = FIG_RE.sub("", latex)  # снять маркеры, чтобы сырой TikZ не ломал рендер
+
     # Tier 1 — основной LaTeX-рендер.
     rendered = await render_solution(latex)
     if rendered["pdf"] or not rendered.get("error"):
+        log_event(telegram_id, "render_latex_ok")
         return rendered, latex
 
-    # ── FREE-MODE: <solver>-fix → <solver>-plain ──
+    # ── FREE-MODE: <solver>-fix (до N попыток) → <solver>-plain ──
     # Конкретный солвер (Gemini/DeepSeek) выбирается роутером по settings.free_mode_solver.
     if _settings.free_mode:
-        logger.warning(f"render failed — {_settings.free_mode_solver}-fix LaTeX (free-mode)")
-        try:
-            fixed = await _solver_fix(latex, rendered["error"])
-            if fixed:
-                fixed = sanitize_for_render(fixed)
-            if fixed and fixed.strip() != latex.strip():
-                re_rend = await render_solution(fixed)
-                if re_rend["pdf"]:
-                    logger.info(f"{_settings.free_mode_solver}-fix succeeded → PDF собран")
-                    return re_rend, fixed
-        except Exception as e:
-            logger.warning(f"solver-fix failed: {e}")
+        err = rendered.get("error") or ""
+        issues = detect_latex_issues(latex)
+        logger.warning(
+            f"render failed — {_settings.free_mode_solver}-fix (issues={issues or 'нет'})"
+        )
+        # Дамп падения для разбора РЕАЛЬНЫХ причин (events.props JSONB), не догадок.
+        log_event(
+            telegram_id, "render_failed",
+            issues=issues, error_tail=err[-600:], latex_head=latex[:1500],
+        )
+        cur = latex
+        for attempt in range(_FREE_FIX_ATTEMPTS):
+            try:
+                fixed = await _solver_fix(cur, err)
+            except Exception as e:
+                logger.warning(f"solver-fix attempt {attempt + 1} failed: {e}")
+                break
+            if not fixed:
+                break
+            fixed = sanitize_for_render(fixed)
+            if fixed.strip() == cur.strip():
+                break  # модель ничего не изменила — дальше бессмысленно
+            re_rend = await render_solution(fixed)
+            if re_rend["pdf"]:
+                logger.info(f"{_settings.free_mode_solver}-fix succeeded (попытка {attempt + 1})")
+                log_event(telegram_id, "render_latex_fixed", attempt=attempt + 1)
+                return re_rend, fixed
+            cur, err = fixed, (re_rend.get("error") or "")
 
         # Tier 3 — plain-формат через ReportLab. PDF будет всегда.
         if condition_text:
@@ -134,9 +176,11 @@ async def _render_with_autofix(latex: str, condition_text: str = "") -> tuple[di
                     rendered_plain = await render_plain_pdf(plain)
                     if rendered_plain.get("pdf"):
                         logger.info("plain-PDF собран ✓")
+                        log_event(telegram_id, "render_plain_fallback")
                         return rendered_plain, plain
             except Exception as e:
                 logger.warning(f"plain-pipeline failed: {e}")
+        log_event(telegram_id, "render_failed_final")
         return rendered, latex
 
     # ── PAID-MODE: legacy Haiku/Sonnet/verbatim chain ──
@@ -294,7 +338,7 @@ async def solve_task_from_photo(
     """Главная точка входа из bot/handlers.py.
 
     mode:
-        "standard" — DeepSeek v3.1 по тексту OCR (+RAG), без thinking, с кэшем.
+        "standard" — solver по free_mode_solver (default Gemini) по тексту OCR (+RAG), без thinking, с кэшем.
         "premium"  — Sonnet 4.6 (vision) + extended thinking ВСЕГДА, без кэша.
 
     on_status — async-колбэк (text) для прогресс-статуса в чате (необязателен).
@@ -385,7 +429,7 @@ async def solve_task_from_photo(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text)
+            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text, telegram_id=user_id)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
         else:
             logger.info(
@@ -440,7 +484,7 @@ async def solve_task_from_photo(
 
     # 9) Рендер PDF + PNG-превью (с кэшем по hash содержимого) + авто-фикс при ошибке
     await _status(on_status, "🖼 Оформляю решение…")
-    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text)
+    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text, telegram_id=user_id)
 
     logger.info(
         f"Pipeline done for user {user_id}: latex={len(latex_clean)} chars, "
@@ -457,7 +501,8 @@ async def solve_task_from_text(
     skip_cache: bool = False,
 ) -> dict:
     """Решить задачу по ТЕКСТУ условия (без фото). Используется в free-mode и для
-    text-input. Всегда DeepSeek (standard-mode), всегда с кэшем.
+    text-input. Всегда стандартный режим (solver по settings.free_mode_solver,
+    default Gemini), всегда с кэшем.
 
     Возвращает:
       • {"empty_input": True} если текст пустой/короткий
@@ -493,7 +538,7 @@ async def solve_task_from_text(
             except Exception as e:
                 logger.warning(f"increment_usage failed: {e}")
             await _status(on_status, "💎 Нашёл готовое решение, оформляю…")
-            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text)
+            rendered, cached_latex = await _render_with_autofix(cached_latex, condition_text=condition_text, telegram_id=user_id)
             return {"latex": cached_latex, "png": rendered["preview_png"], "pdf": rendered["pdf"]}
 
     rag_context = build_rag_context(similar_for_rag[:RAG_USE_TOP])
@@ -520,7 +565,7 @@ async def solve_task_from_text(
         )
 
     await _status(on_status, "🖼 Оформляю решение…")
-    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text)
+    rendered, latex_clean = await _render_with_autofix(latex_clean, condition_text=condition_text, telegram_id=user_id)
 
     logger.info(
         f"Pipeline (text) done for user {user_id}: latex={len(latex_clean)} chars, "
@@ -554,6 +599,22 @@ def is_complex_task(task_text: str) -> bool:
 def classify_topic(task_text: str) -> str:
     """Эвристическая классификация темы по ключевым словам."""
     text = task_text.lower()
+
+    # Физика — проверяем ПЕРВОЙ, по специфичным фразам, чтобы сильный физ-сигнал
+    # не утёк в matan/lin_alg. Ключи подобраны без пересечений с математикой
+    # (НЕ берём "поле", "вектор", "индукц", "скорост" — они есть в мат-задачах).
+    if any(kw in text for kw in [
+        "ускорени", "сила тяжест", "сила трен", "сила упругост", "силы трен",
+        "закон ньютон", "второй закон ньютон", "импульс тел", "импульс част",
+        "кинетическ энерг", "потенциальн энерг", "механическ работ",
+        "наклонн плоскост", "свободн паден", "брошен", "тело массой",
+        "сила тока", "электрическ ток", "конденсатор", "резистор",
+        "сопротивлен", "электродвижущ", "эдс", "магнитн пол", "магнитн индукц",
+        "термодинамик", "теплоёмк", "теплот", "идеальн газ", "давлени газ",
+        "оптик", "преломлен", "фокусн расстоян", "собирающ линз", "рассеивающ линз",
+        "маятник", "период колебан", "длин волн", "амплитуд колебан",
+    ]):
+        return "physics"
 
     if any(kw in text for kw in [
         "групп", "подгрупп", "гомоморф", "изоморф", "циклич",

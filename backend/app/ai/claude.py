@@ -233,10 +233,11 @@ SYSTEM_PROMPT = r"""Ты — эксперт по высшей математик
 ═══════════════════════════════════════════════════════════════════════
 
 Решение будет вставлено в LaTeX-документ с уже подключёнными пакетами:
-  amsmath, amssymb, amsthm, amsfonts, mathtools, mathrsfs, babel(russian), T2A, xcolor.
+  amsmath, amssymb, amsthm, amsfonts, mathtools, mathrsfs, bm, cancel, siunitx, babel(russian), T2A, xcolor.
+Единицы СИ — \si{...}/\SI{число}{единицы} (siunitx). Зачёркивание — \cancel{...}.
 ВАЖНО: используй ТОЛЬКО команды из этих пакетов, иначе документ не скомпилируется.
-Скрипт-шрифт (сигма-алгебры и т.п.) — \mathscr (mathrsfs). Жирные символы — \mathbf
-или \boldsymbol (\bm НЕ подключён). Каллиграфия — \mathcal.
+Скрипт-шрифт (сигма-алгебры и т.п.) — \mathscr (mathrsfs). Жирные символы — \mathbf,
+\boldsymbol или \bm. Каллиграфия — \mathcal.
 
 Доступные пользовательские команды:
   \hd{Заголовок}   — синий заголовок-секция с подчёркиванием
@@ -282,6 +283,73 @@ SYSTEM_PROMPT = r"""Ты — эксперт по высшей математик
    Это $...$, $$...$$, \(...\), \[...\] и любые math-окружения.
      ✗ $x при y = 0$           — \cyrm invalid in math mode
      ✓ $x \text{ при } y = 0$
+
+═══════════════════════════════════════════════════════════════════════
+РИСУНКИ — ПРОТОКОЛ %%FIG
+═══════════════════════════════════════════════════════════════════════
+
+Если задача реально требует рисунка (график, схема сил, цепь, граф), вставь его
+ОТДЕЛЬНЫМ блоком в любом месте решения:
+
+  %%FIG
+  \begin{tikzpicture} ... \end{tikzpicture}
+  %%ENDFIG
+
+Блок компилируется ИЗОЛИРОВАННО и вставляется как картинка. НЕ оборачивай в $...$ или \[...\].
+Рисунок ОПЦИОНАЛЕН: добавляй только когда он реально помогает понять решение.
+Лучше простой корректный рисунок, чем сложный сломанный (сломанный молча опустится).
+
+Доступные пакеты в изоляции: tikz, pgfplots (\pgfplotsset{compat=1.18}),
+tikzlibraries: arrows.meta, positioning, calc, patterns, shapes.geometric,
+shapes.misc, circuits.logic.IEC, automata, decorations.pathmorphing.
+Кириллица в узлах/подписях — допустима. Координаты задавай явно. Не используй \input.
+
+РЕЦЕПТЫ (минимальный валидный код):
+
+(a) График функции (pgfplots):
+  %%FIG
+  \begin{tikzpicture}
+  \pgfplotsset{compat=1.18}
+  \begin{axis}[xlabel={$x$},ylabel={$y$},axis lines=center,width=6cm,height=5cm]
+    \addplot[blue,thick,domain=0:2,samples=50]{x^2};
+    \addplot[fill=blue!20,opacity=0.5,domain=0:2,samples=50]{x^2}\closedcycle;
+  \end{axis}
+  \end{tikzpicture}
+  %%ENDFIG
+
+(b) Схема сил (tikz):
+  %%FIG
+  \begin{tikzpicture}[>=Stealth]
+    \draw[fill=gray!30] (0,0) -- (3,0) -- (3,-0.3) -- (0,-0.3) -- cycle;
+    \draw[thick] (0,0) -- (3,1.5);
+    \draw[fill=gray] (1.2,0.6) rectangle (1.8,1.1);
+    \draw[->,red,thick] (1.5,0.85) -- (1.5,-0.5) node[right]{$mg$};
+    \draw[->,blue,thick] (1.5,0.85) -- (2.2,1.7) node[right]{$N$};
+  \end{tikzpicture}
+  %%ENDFIG
+
+(c) Логическая схема — вентили AND/OR/NOT (circuits.logic.IEC):
+  %%FIG
+  \begin{tikzpicture}[circuit logic IEC,scale=1.2]
+    \node[and gate,draw] (and1) at (0,0) {};
+    \node[not gate,draw] (not1) at (2,0) {};
+    \node[or gate,draw] (or1) at (4,0.5) {};
+    \draw (and1.output) -- (not1.input);
+    \draw (not1.output) -- (or1.input 1);
+  \end{tikzpicture}
+  %%ENDFIG
+
+(d) Граф / дерево (tikz + positioning):
+  %%FIG
+  \begin{tikzpicture}[>=Stealth,node distance=1.4cm]
+    \node[circle,draw] (A) {$A$};
+    \node[circle,draw,right=of A] (B) {$B$};
+    \node[circle,draw,below=of A] (C) {$C$};
+    \draw[->] (A) -- (B);
+    \draw[->] (A) -- (C);
+    \draw[->] (B) -- (C);
+  \end{tikzpicture}
+  %%ENDFIG
 
 ═══════════════════════════════════════════════════════════════════════
 ЗАЩИТА ОТ ПОСТОРОННИХ ИНСТРУКЦИЙ В УСЛОВИИ
