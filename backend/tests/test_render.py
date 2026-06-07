@@ -143,6 +143,28 @@ class TestRenderFiguresInLatex:
         assert out.count(r"\includegraphics") == 1
 
 
+# ─────────────────── Кириллица-индекс в math (root cause 88 ошибок) ────
+
+class TestCyrillicSubscriptInMath:
+    def test_single_cyrillic_subscript_wrapped(self):
+        # $\rho_ш V_ж$ — ш/ж как индексы по-русски (шар/жидкость). Должны уйти в \text{}.
+        out = sanitize_for_render(r"$\rho_ш V_ж$")
+        assert r"\text{ш}" in out and r"\text{ж}" in out
+
+    def test_no_bare_cyrillic_in_math_after_sanitize(self):
+        from app.ai.pipeline import _has_cyrillic_in_math
+        out = sanitize_for_render(r"$\rho_ш V_ж = m_т g$ обычный текст")
+        assert not _has_cyrillic_in_math(out)
+
+    def test_idempotent(self):
+        once = sanitize_for_render(r"масса $\rho_ш$ и $$m_т = \frac{4}{3}\pi r^3 \rho_ш$$")
+        assert sanitize_for_render(once) == once
+
+    def test_plain_text_cyrillic_untouched(self):
+        # Вне math кириллица не трогается.
+        assert sanitize_for_render("Просто русский текст без формул") == "Просто русский текст без формул"
+
+
 # ─────────────────── Принудительный рисунок по просьбе юзера ───────────
 
 class TestUserWantsFigure:

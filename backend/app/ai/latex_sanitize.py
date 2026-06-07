@@ -135,9 +135,12 @@ def fix_ans_with_block(text: str) -> str:
 
 # ─────────────────── 4. Кириллица в math без \text{} ──────────────────
 
-# Слово из 2+ кириллических букв (одиночные буквы — оставляем, могут быть переменными).
+# Кириллица в math-режиме под T2A ВСЕГДА фатальна — даже одиночная буква
+# (частый кейс: индексы по-русски — $\rho_ш$, $V_ж$, $m_т$, $S_{уст}$ — где
+# ш=шар, ж=жидкость и т.п.). Поэтому оборачиваем 1+ букв (раньше было 2+, и
+# одиночные буквы-индексы давали десятки ошибок «\cyrsh invalid in math mode»).
 # Соседние слова через пробел/дефис включаем в одну группу.
-_CYR_WORD_RE = re.compile(r"[а-яА-ЯёЁ]{2,}(?:[ \-][а-яА-ЯёЁ]+)*")
+_CYR_WORD_RE = re.compile(r"[а-яА-ЯёЁ]+(?:[ \-][а-яА-ЯёЁ]+)*")
 
 # Команды-обёртки, которые уже корректно содержат текст в math-режиме.
 _TEXT_LIKE_CMDS = (
@@ -200,6 +203,23 @@ _BLOCK_ENV_RE = re.compile(
 )
 
 
+def _wrap_cyr_in_ans(text: str) -> str:
+    r"""Содержимое \ans{...} рендерится в math (\boxed) — кириллица там тоже
+    фатальна. Оборачиваем её в \text{} (частый кейс: $\ans{\eta=...v_уст}$ с
+    русскими индексами). \hd{...} НЕ трогаем — это текстовый заголовок."""
+    spans = _find_ans_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end, body in spans:
+        out.append(text[last:start])
+        out.append("\\ans{" + _wrap_cyr_in_block(body) + "}")
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def wrap_cyrillic_in_math(text: str) -> str:
     """Оборачивает кириллические слова в \\text{} ВНУТРИ math-режимов."""
     def repl_simple(m: "re.Match[str]") -> str:
@@ -214,6 +234,7 @@ def wrap_cyrillic_in_math(text: str) -> str:
     text = _INLINE_PAREN_RE.sub(repl_simple, text)
     text = _INLINE_DOLLAR_RE.sub(repl_simple, text)
     text = _BLOCK_ENV_RE.sub(repl_env, text)
+    text = _wrap_cyr_in_ans(text)
     return text
 
 

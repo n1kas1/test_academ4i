@@ -272,12 +272,14 @@ def test_sanitize_wraps_cyrillic_in_align_env():
     assert r"\text{где}" in out
 
 
-def test_sanitize_doesnt_wrap_single_cyrillic_letter():
-    """Одиночная кир-буква может быть переменной (х, у, ξ-как-х) — не оборачиваем."""
+def test_sanitize_wraps_single_cyrillic_letter():
+    """Одиночная кир-буква в math под T2A фатальна (\\cyrh invalid in math mode) —
+    даже если задумывалась как переменная. Оборачиваем в \\text{}, чтобы собралось
+    (частый кейс — русские индексы $\\rho_ш$). Раньше НЕ оборачивали → 88 ошибок."""
     from app.ai.latex_sanitize import sanitize_for_render
-    src = r"$х + у = 0$"  # одиночные буквы
+    src = r"$х + у = 0$"  # одиночные кир-буквы
     out = sanitize_for_render(src)
-    assert r"\text{х}" not in out
+    assert r"\text{х}" in out and r"\text{у}" in out
 
 
 def test_sanitize_is_idempotent():
@@ -333,11 +335,12 @@ def test_sanitize_no_runaway_wrap_with_nested_text_textbf():
 
 # ─── _CYR_WORD_RE: проверка, что одиночные кир-буквы не оборачиваются ───
 
-def test_sanitize_single_cyr_letters_unchanged():
+def test_sanitize_single_cyr_letters_wrapped_for_t2a():
+    """Одиночные кир-буквы в math оборачиваются (иначе T2A роняет рендер)."""
     from app.ai.latex_sanitize import sanitize_for_render
-    src = r"$х + у = 0$"  # одиночные кир-буквы — переменные
+    src = r"$х + у = 0$"
     out = sanitize_for_render(src)
-    assert out == src
+    assert out != src and r"\text{" in out
 
 
 # ─── display-math с конкретным wrap кириллицы ───────────────────────────
