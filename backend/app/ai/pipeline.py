@@ -37,8 +37,8 @@ from loguru import logger
 
 from app.ai.vision import prepare_image
 from app.ai.claude import solve_with_claude_vision, extract_condition_text, fix_latex, fix_latex_strong
-from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek
-from app.ai.gemini import solve_with_gemini, solve_with_gemini_plain, fix_latex_with_gemini
+from app.ai.deepseek import solve_with_deepseek, solve_with_deepseek_plain, fix_latex_with_deepseek, generate_figure_with_deepseek
+from app.ai.gemini import solve_with_gemini, solve_with_gemini_plain, fix_latex_with_gemini, generate_figure_with_gemini
 from app.ai.latex_sanitize import sanitize_for_render, detect_latex_issues
 from app.render.plain_pdf import render_plain_pdf
 from app.render.figures import render_figures_in_latex, FIG_RE
@@ -68,6 +68,46 @@ def _solver_fix(broken_latex: str, error_log: str):
     if _settings.free_mode_solver == "deepseek":
         return fix_latex_with_deepseek(broken_latex, error_log)
     return fix_latex_with_gemini(broken_latex, error_log)
+
+
+def _solver_figure(condition_text: str, user_hint: str = "", solution_excerpt: str = ""):
+    if _settings.free_mode_solver == "deepseek":
+        return generate_figure_with_deepseek(condition_text, user_hint, solution_excerpt)
+    return generate_figure_with_gemini(condition_text, user_hint, solution_excerpt)
+
+
+# Юзер ЯВНО просит рисунок (в caption к фото или в тексте). Триггеры — глаголы
+# рисования + «график». При срабатывании рисунок становится ОБЯЗАТЕЛЬНЫМ: если
+# солвер его не вставил, догенерируем отдельным узким вызовом (_ensure_figure).
+_FIG_REQUEST_KW = (
+    "нарису", "нарисов", "график", "изобраз", "начерт", "диаграмм", "чертёж", "чертеж",
+    "построить график", "постройте график", "построй график", "схему", "схема",
+    "plot", "graph",
+)
+
+
+def _user_wants_figure(condition_text: str, user_hint: str = "") -> bool:
+    blob = f"{user_hint}\n{condition_text}".lower()
+    return any(k in blob for k in _FIG_REQUEST_KW)
+
+
+async def _ensure_figure(latex_clean: str, condition_text: str, user_hint: str = "") -> str:
+    """Гарантия рисунка по явной просьбе юзера. Если просил и солвер НЕ вставил
+    %%FIG — догенерируем отдельным целевым вызовом и дописываем блок в решение."""
+    if not _user_wants_figure(condition_text, user_hint):
+        return latex_clean
+    if FIG_RE.search(latex_clean):
+        return latex_clean  # модель уже вставила рисунок — ничего не делаем
+    try:
+        fig = await _solver_figure(condition_text, user_hint, latex_clean[:1500])
+    except Exception as e:
+        logger.warning(f"forced figure generation failed: {e}")
+        return latex_clean
+    if fig and FIG_RE.search(fig):
+        logger.info("figure: добавлен принудительно (юзер просил рисунок, солвер не вставил)")
+        return latex_clean.rstrip() + "\n\n" + fig + "\n"
+    logger.warning("forced figure: модель не вернула валидный %%FIG-блок")
+    return latex_clean
 
 
 _PLAIN_MARKERS = ("Задача:", "Решение:", "Ответ:")
@@ -461,6 +501,8 @@ async def solve_task_from_photo(
     # Sanitize ПЕРЕД сохранением в кэш — чтобы будущим юзерам не приходил
     # сломанный LaTeX, который потом будет провоцировать дорогую цепочку фиксов.
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
+    # Гарантия рисунка, если юзер ЯВНО просил (модель часто игнорит просьбу).
+    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint)
 
     # 8) Сохраняем LaTeX в кэш для будущих юзеров — только если это реально решение.
     if _is_cacheable_solution(latex_clean):
@@ -549,6 +591,8 @@ async def solve_task_from_text(
         user_hint=user_hint,
     )
     latex_clean = sanitize_for_render(_clean_latex(solution_raw))
+    # Гарантия рисунка, если юзер ЯВНО просил (модель часто игнорит просьбу).
+    latex_clean = await _ensure_figure(latex_clean, condition_text, user_hint)
 
     if _is_cacheable_solution(latex_clean):
         try:

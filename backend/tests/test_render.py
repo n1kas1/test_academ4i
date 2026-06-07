@@ -143,6 +143,40 @@ class TestRenderFiguresInLatex:
         assert out.count(r"\includegraphics") == 1
 
 
+# ─────────────────── Принудительный рисунок по просьбе юзера ───────────
+
+class TestUserWantsFigure:
+    def test_draw_verbs_trigger(self):
+        from app.ai.pipeline import _user_wants_figure
+        assert _user_wants_figure("", "нарисуй графики распределения и плотности")
+        assert _user_wants_figure("постройте график функции y=x^2", "")
+        assert _user_wants_figure("", "изобрази схему сил")
+
+    def test_no_trigger_on_plain_task(self):
+        from app.ai.pipeline import _user_wants_figure
+        assert not _user_wants_figure("найти производную функции", "реши пункт б")
+        assert not _user_wants_figure("вычислить интеграл", "")
+
+
+class TestExtractFigBlock:
+    def test_extracts_marked_block(self):
+        from app.ai.deepseek import _extract_fig_block
+        raw = "текст\n%%FIG\n\\begin{tikzpicture}\\draw(0,0)--(1,1);\\end{tikzpicture}\n%%ENDFIG\nещё"
+        out = _extract_fig_block(raw)
+        assert out.startswith("%%FIG") and out.rstrip().endswith("%%ENDFIG")
+        assert "tikzpicture" in out
+
+    def test_wraps_bare_tikzpicture(self):
+        from app.ai.deepseek import _extract_fig_block
+        raw = "```latex\n\\begin{tikzpicture}\\draw(0,0)circle(1);\\end{tikzpicture}\n```"
+        out = _extract_fig_block(raw)
+        assert "%%FIG" in out and "tikzpicture" in out and "```" not in out
+
+    def test_empty_when_no_figure(self):
+        from app.ai.deepseek import _extract_fig_block
+        assert _extract_fig_block("просто текст без рисунка") == ""
+
+
 # ─────────────────── Реальный кейс пользователя (классы Поста) ─────────
 
 # Условие, которое падало у пользователя (дискретка: минимальные полные

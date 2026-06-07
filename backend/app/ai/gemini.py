@@ -29,6 +29,9 @@ from app.ai.deepseek import (
     _build_user_text,
     _build_user_text_plain,
     _DS_FIX_SYSTEM,
+    FIGURE_SYSTEM_PROMPT,
+    _build_figure_user_text,
+    _extract_fig_block,
 )
 
 
@@ -131,6 +134,16 @@ async def solve_with_gemini_plain(
     """Решить задачу в plain-формате (Unicode math, без LaTeX). Зеркалит solve_with_deepseek_plain."""
     user_text = _build_user_text_plain(condition_text, rag_context, user_hint)
     return await _generate(SYSTEM_PROMPT_PLAIN, user_text, log_tag="plain")
+
+
+async def generate_figure_with_gemini(
+    condition_text: str, user_hint: str = "", solution_excerpt: str = ""
+) -> str:
+    """Сгенерировать ТОЛЬКО рисунок через Gemini. Возвращает %%FIG-блок или ''.
+    Зеркалит generate_figure_with_deepseek (общий промпт/хелперы из deepseek.py)."""
+    user_text = _build_figure_user_text(condition_text, user_hint, solution_excerpt)
+    out = await _generate(FIGURE_SYSTEM_PROMPT, user_text, log_tag="figure")
+    return _extract_fig_block(out)
 
 
 async def fix_latex_with_gemini(broken_latex: str, error_log: str) -> str:
