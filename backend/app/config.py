@@ -1,4 +1,7 @@
 """Настройки приложения. Грузим из .env через pydantic-settings."""
+from dataclasses import dataclass
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,20 +18,65 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str = "change-me"
     webhook_domain: str = "academ4i.duckdns.org"
 
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def _check_webhook_secret(cls, v: str) -> str:
+        """Fail-loud: не стартовать с предсказуемым/слабым секретом вебхука — иначе
+        любой, зная дефолт 'change-me', слал бы поддельные апдейты на /webhook.
+        Сгенерировать: python -c \"import secrets;print(secrets.token_urlsafe(32))\"."""
+        if v in ("", "change-me") or len(v) < 16:
+            raise ValueError(
+                "TELEGRAM_WEBHOOK_SECRET не задан/слабый (нужно >=16 символов, не 'change-me')"
+            )
+        return v
+
     # === Anthropic (Claude) — через ProxyAPI ===
     anthropic_api_key: str
     anthropic_base_url: str = "https://api.proxyapi.ru/anthropic"
     claude_model: str = "claude-sonnet-4-6"
     claude_use_extended_thinking: bool = True
-    # Модель лёгкого OCR-прохода (распознать условие + номера задач).
-    # Haiku: распознавание — простая работа, в разы дешевле Sonnet; решение остаётся на claude_model.
+    # Haiku — дешёвая модель для лёгких задач (topic-gate, fix_latex). НЕ для OCR.
     ocr_model: str = "claude-haiku-4-5-20251001"
+    # Vision-OCR условия задачи: Sonnet (≈2.6× дороже Haiku, но кратно меньше
+    # галлюцинаций на формулах). ≈1₽ за OCR vs 0.4₽ у Haiku. Стоит того —
+    # битый condition_text ломает всю цепочку решения, переплачивать на solve
+    # в разы дороже потерянной точности.
+    vision_ocr_model: str = "claude-sonnet-4-6"
 
     # === OpenAI — через ProxyAPI (для эмбеддингов и парсинга PDF) ===
     openai_api_key: str
     openai_base_url: str = "https://api.proxyapi.ru/openai/v1"
     embedding_model: str = "text-embedding-3-small"
     parser_model: str = "gpt-4o"
+
+    # === DeepSeek (standard-режим) — через OpenAI-совместимый шлюз ProxyAPI ===
+    # Шлюз маршрутизирует по префиксу модели (openrouter/<provider>/<model>).
+    # Отличается от openai_base_url (тот — чистый OpenAI passthrough для эмбеддингов).
+    deepseek_model: str = "openrouter/deepseek/deepseek-chat-v3.1"
+    openai_compat_base_url: str = "https://openai.api.proxyapi.ru/v1"
+
+    # === Gemini 2.5 Flash — основной солвер free-mode (быстрее DeepSeek в 3-5×) ===
+    # Native Google-формат через ProxyAPI (не OpenAI-совместимый): URL вида
+    # {base}/v1beta/models/{model}:generateContent?key=<api_key>. Тот же ProxyAPI
+    # ключ что у openai (один ключ на все шлюзы ProxyAPI).
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_base_url: str = "https://api.proxyapi.ru/google"
+    # Какой солвер использовать в free-mode: "gemini" (быстро) или "deepseek" (медленно).
+    # Менять через .env (FREE_MODE_SOLVER=deepseek), без редеплоя кода — для quick rollback.
+    free_mode_solver: str = "gemini"
+
+    @field_validator("free_mode_solver")
+    @classmethod
+    def _check_free_mode_solver(cls, v: str) -> str:
+        """Fail-loud при typo в .env. Иначе при `FREE_MODE_SOLVER=deepseeek` (typo)
+        роутер молча уходит в Gemini — админ думает что откатил, а проблема та же."""
+        v = v.strip().lower()
+        allowed = {"gemini", "deepseek"}
+        if v not in allowed:
+            raise ValueError(
+                f"free_mode_solver must be one of {sorted(allowed)}, got '{v}'"
+            )
+        return v
 
     # === Postgres ===
     database_url: str
@@ -60,6 +108,23 @@ class Settings(BaseSettings):
     pack_large_price_stars: int = 139
     pack_large_tasks: int = 10
 
+    # === Credit-based pricing (новая модель) ===
+    # Вес режимов — сколько кредитов списывается за одно решение.
+    standard_cost: int = 1      # credit-mode standard; solver роутится по free_mode_solver (default Gemini)
+    premium_cost: int = 10      # Sonnet 4.6 + extended thinking (vision)
+    trial_credits: int = 5      # начисляется новому юзеру при первом /start
+
+    # === Free-mode (временная промо-модель: всё бесплатно, только DeepSeek) ===
+    # Включи `free_mode=True` чтобы выключить весь paywall: фото/текст идут сразу
+    # в DeepSeek, без выбора режима, без списания кредитов, без покупок в меню.
+    # `free_mode=False` → credit-pricing активен (выбор режима, списания, пакеты).
+    # Daily cap per user (Redis-based, UTC-сутки) — защита от абьюза без paywall.
+    free_mode: bool = True
+    free_daily_cap: int = 30
+    # Принимаем только математику/физику. Haiku-гейт классифицирует входящий текст
+    # (для фото — после OCR). Используем settings.ocr_model (Haiku).
+    topic_gate_enabled: bool = True
+
     # === Админы (безлимит) — usernames через запятую без @ ===
     admin_usernames: str = "manag31"
 
@@ -78,3 +143,25 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# === Каталог пакетов кредитов (Telegram Stars) ===
+
+@dataclass(frozen=True)
+class CreditPackage:
+    key: str        # внутренний идентификатор
+    title: str      # отображаемое имя
+    credits: int    # сколько кредитов начисляется
+    stars: int      # цена в Telegram Stars
+    payload: str    # invoice payload (идемпотентность платежа)
+
+
+CREDIT_PACKAGES: list[CreditPackage] = [
+    CreditPackage("sok",      "Sok",      10,  79,   "academ4i_credits_sok"),
+    CreditPackage("mini",     "Mini",     25,  149,  "academ4i_credits_mini"),
+    CreditPackage("standard", "Standard", 75,  399,  "academ4i_credits_standard"),
+    CreditPackage("large",    "Large",    200, 899,  "academ4i_credits_large"),
+    CreditPackage("mega",     "Mega",     500, 1990, "academ4i_credits_mega"),
+]
+
+PACKAGES_BY_PAYLOAD: dict[str, CreditPackage] = {p.payload: p for p in CREDIT_PACKAGES}

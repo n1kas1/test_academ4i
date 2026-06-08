@@ -4,6 +4,8 @@
 - меню: 📊 Статистика / 📢 Рассылка
 - статистика: переключатель периода (сегодня / 7 / 30 дней), пересчёт по кнопке
 """
+from datetime import datetime, timedelta, timezone
+
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, Filter
@@ -15,11 +17,41 @@ from aiogram.types import (
 )
 from sqlalchemy import text
 
+from app.config import settings
 from app.core.background import spawn
 from app.core.db import get_session
 from app.core.redis import get_redis
 from app.notify import broadcast_send
 from app.ratelimit import is_admin
+
+
+# МСК-таймзона: для бота, делавшегося под москвичей, «сегодня» = МСК-сутки.
+_MSK = timezone(timedelta(hours=3))
+
+# Эмпирическая средняя стоимость одного solve в ₽ (по логам ProxyAPI):
+# free-mode: Haiku-gate ≈ 0.1 + DeepSeek-solve ≈ 0.2 + изредка fix/plain ≈ 0.2 → ≈ 0.5.
+# paid-mode (когда вернёмся): premium ≈ 10, standard ≈ 0.2; в среднем ≈ 4.
+_AVG_COST_FREE_RUB = 0.5
+_AVG_COST_PAID_RUB = 4.0
+
+
+def _period_start(days: int) -> datetime:
+    """Начало периода в UTC.
+
+    days=1 → начало текущих суток МСК (а не «последние 24 часа»). Иначе
+    скользящее окно от now() − days.
+    """
+    if days == 1:
+        msk_now = datetime.now(_MSK)
+        msk_today_start = msk_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return msk_today_start.astimezone(timezone.utc)
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _estimated_cost_rub(solves: int) -> tuple[float, float]:
+    """Возвращает (avg_per_solve, total) — оценка расходов на ProxyAPI."""
+    avg = _AVG_COST_FREE_RUB if settings.free_mode else _AVG_COST_PAID_RUB
+    return avg, solves * avg
 
 
 class IsAdmin(Filter):
@@ -81,37 +113,77 @@ def _stats_kb(active_days: int) -> InlineKeyboardMarkup:
 _STATS_SQL = text("""
 SELECT
   (SELECT COUNT(*) FROM users) AS total_users,
-  (SELECT COUNT(*) FROM users WHERE created_at > now() - make_interval(days => :days)) AS new_p,
-  (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at > now() - make_interval(days => :days)) AS active_p,
-  (SELECT COUNT(*) FROM events WHERE type='solve' AND created_at > now() - make_interval(days => :days)) AS solved_p,
+  (SELECT COUNT(*) FROM users WHERE created_at >= :start) AS new_p,
+  (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE created_at >= :start) AS active_p,
+  (SELECT COUNT(*) FROM events WHERE type='solve' AND created_at >= :start) AS solved_p,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='start') AS f_start,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='solve') AS f_solve,
   (SELECT COUNT(DISTINCT telegram_id) FROM events WHERE type='paywall_shown') AS f_paywall,
   (SELECT COUNT(DISTINCT telegram_id) FROM payments WHERE status='succeeded') AS f_purchase,
   (SELECT COALESCE(SUM(amount_stars), 0) FROM payments WHERE status='succeeded'
-     AND created_at > now() - make_interval(days => :days)) AS revenue_p
+     AND created_at >= :start) AS revenue_p
 """)
 
 _PRODUCTS_SQL = text(
     "SELECT product, COUNT(*) AS n FROM payments WHERE status='succeeded' GROUP BY product"
 )
 
+# Топ активных юзеров за период — для связи (узнать кому проблема, кто фармит).
+# LEFT JOIN: events.telegram_id может ссылаться на юзера до того как тот залился в users
+# (race условие первой задачи). NULL username → выводим только tg-id.
+_TOP_USERS_SQL = text("""
+SELECT
+  e.telegram_id AS tg,
+  u.username    AS username,
+  COUNT(*)      AS solves
+FROM events e
+LEFT JOIN users u ON u.telegram_id = e.telegram_id
+WHERE e.type = 'solve' AND e.created_at >= :start
+GROUP BY e.telegram_id, u.username
+ORDER BY solves DESC
+LIMIT 10
+""")
+
 
 async def _render_stats(days: int) -> str:
-    label = next((lbl for d, lbl in _PERIODS if d == days), f"{days} дн")
+    if days == 1:
+        label = "сегодня (МСК)"
+    else:
+        label = next((lbl for d, lbl in _PERIODS if d == days), f"{days} дн")
+    start = _period_start(days)
     async with get_session() as session:
-        r = (await session.execute(_STATS_SQL, {"days": days})).one()._mapping
+        r = (await session.execute(_STATS_SQL, {"start": start})).one()._mapping
         products = (await session.execute(_PRODUCTS_SQL)).all()
+        top_users = (await session.execute(_TOP_USERS_SQL, {"start": start})).all()
 
     prod_lines = "\n".join(f"   • {p}: {n}" for p, n in products) or "   • —"
+    avg_rub, total_rub = _estimated_cost_rub(r["solved_p"])
+    mode_badge = "✨ free (DeepSeek)" if settings.free_mode else "💎 paid (DeepSeek + Sonnet)"
+
+    # Топ юзеров за период — строки: «N. tg=12345 @user — 7 задач».
+    # Если username пустой → выводим только tg-id (для связи: tg://user?id= в TG).
+    if top_users:
+        top_lines = []
+        for i, row in enumerate(top_users, 1):
+            tg, uname, solves = row.tg, row.username, row.solves
+            handle = f" @{uname}" if uname else ""
+            top_lines.append(f"   {i}. <code>{tg}</code>{handle} — <b>{solves}</b>")
+        top_block = "\n".join(top_lines)
+    else:
+        top_block = "   • —"
 
     return (
         f"📊 <b>Статистика</b> · <i>{label}</i>\n"
+        f"<i>Режим: {mode_badge}</i>\n"
         "━━━━━━━━━━━━━━\n"
         "👥 <b>Аудитория</b>\n"
         f"Всего юзеров: <b>{r['total_users']}</b>\n"
         f"Новых: <b>{r['new_p']}</b> · активных: <b>{r['active_p']}</b>\n"
         f"Решено задач: <b>{r['solved_p']}</b>\n\n"
+        "👤 <b>Топ юзеров за период</b> <i>(для связи)</i>\n"
+        f"{top_block}\n\n"
+        "💸 <b>Расход (оценка ProxyAPI)</b>\n"
+        f"≈ <b>{total_rub:.1f}₽</b>  <i>({avg_rub}₽/задача × {r['solved_p']})</i>\n\n"
         "🛒 <b>Воронка</b> <i>(за всё время)</i>\n"
         f"🟢 Старт — <b>{r['f_start']}</b>\n"
         f"✏️ Решили ≥1 — <b>{r['f_solve']}</b>{_pct_suffix(r['f_solve'], r['f_start'])}\n"
@@ -140,13 +212,14 @@ async def admin_menu(callback: CallbackQuery):
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    await message.answer(await _render_stats(7), reply_markup=_stats_kb(7))
+    # Открываем сразу на «сегодня (МСК)» — самый частый кейс для админа.
+    await message.answer(await _render_stats(1), reply_markup=_stats_kb(1))
 
 
 @router.callback_query(F.data == "admin:stats")
 async def admin_stats(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text(await _render_stats(7), reply_markup=_stats_kb(7))
+    await callback.message.edit_text(await _render_stats(1), reply_markup=_stats_kb(1))
 
 
 @router.callback_query(F.data.startswith("stats:"))

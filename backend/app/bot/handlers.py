@@ -1,9 +1,10 @@
-"""Telegram bot handlers.
+"""Telegram bot handlers (credit-модель).
 
 Routing:
-  /start, /menu — главное меню (reply-keyboard под клавиатурой)
-  фото → check_quota → pipeline → PNG + LaTeX button → consume_quota
-  Кнопки меню (BTN_*) — переход на покупку или /balance / /help
+  /start, /menu — главное меню (reply-keyboard)
+  фото/документ → выбор режима (стандарт/премиум) с показом баланса
+  выбор режима → pipeline(mode) → доставка → списание кредитов
+  Кнопки меню (BTN_*) — пакеты кредитов / баланс / помощь
 """
 import asyncio
 import io
@@ -22,63 +23,92 @@ from aiogram.types import (
 )
 from loguru import logger
 
-from app.ai.pipeline import solve_task_from_photo
+import httpx
+from anthropic import APITimeoutError as AnthropicTimeoutError, APIConnectionError as AnthropicConnError
+from openai import APITimeoutError as OpenAITimeoutError, APIConnectionError as OpenAIConnError
+
+from app.ai.pipeline import solve_task_from_photo, solve_task_from_text
+from app.ai.haiku_gate import is_math_or_physics
+
+# Все таймауты/проблемы коннекта от LLM-провайдеров — один кортеж для except.
+# httpx.* добавлен для Gemini-пути (он идёт мимо openai SDK, прямой httpx). Без
+# них Gemini-таймаут падает в общий `except Exception` → юзер видит MSG_ERROR
+# вместо MSG_TIMEOUT, и мониторинг провайдер-лагов теряется в шуме.
+_LLM_TIMEOUT_EXCS = (
+    AnthropicTimeoutError, AnthropicConnError,
+    OpenAITimeoutError, OpenAIConnError,
+    httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+)
 from app.bot.keyboards import (
     BTN_BALANCE,
-    BTN_BUY_PACK,
-    BTN_BUY_PREMIUM,
+    BTN_BUY_CREDITS,
     BTN_HELP,
     main_menu_keyboard,
-    pack_choice_keyboard,
-    premium_choice_keyboard,
+    mode_choice_keyboard,
+    packages_keyboard,
     solution_keyboard,
     task_choice_keyboard,
 )
 from app.bot.messages import (
-    MSG_ADMIN_WELCOME,
-    MSG_BUY_PACK_PROMPT,
-    MSG_BUY_PREMIUM_PROMPT,
-    MSG_DEMO_CAPTION,
-    MSG_PREMIUM_CAP,
-    MSG_ERROR,
-    MSG_HELP,
-    MSG_PROCESSING,
-    MSG_START,
     MSG_ADMIN_HELP,
-    msg_balance,
+    MSG_ADMIN_WELCOME,
+    MSG_BUY_CREDITS_PROMPT,
+    MSG_DAILY_CAP_REACHED,
+    MSG_DEMO_CAPTION,
+    MSG_ERROR,
+    MSG_HELP_CREDITS,
+    MSG_HELP_FREE,
+    MSG_INFLIGHT,
+    MSG_NOT_MATH,
+    MSG_OCR_FAILED_STANDARD,
+    MSG_PROCESSING,
+    MSG_START_CREDITS,
+    MSG_START_FREE,
+    MSG_TEXT_PROCESSING,
+    MSG_TIMEOUT,
+    msg_balance_credits,
+    msg_balance_free,
     msg_choose_task,
-    msg_quota_exceeded,
+    msg_insufficient_credits,
+    msg_mode_prompt,
 )
 from app.config import settings
 from app.core.redis import get_redis
 from app.analytics import log_event
 from app.ratelimit import (
-    check_quota,
+    CreditStatus,
+    bump_daily_used,
+    check_daily_cap,
     check_rate_limit,
-    consume_quota,
+    consume_credits,
+    get_credit_status,
+    get_daily_used,
     get_or_create_user,
     is_admin,
+    release_inflight,
+    try_acquire_inflight,
 )
 
 router = Router()
+PENDING_TTL_SECONDS = 3600
 TASKPICK_TTL_SECONDS = 3600
 SOLUTION_TTL_SECONDS = 3600
 
-# Документы, которые принимаем как задачу: картинки и PDF.
 _DOC_PDF = "application/pdf"
-_MAX_DOC_BYTES = 20 * 1024 * 1024  # лимит загрузки файла Telegram-ботом
+_MAX_DOC_BYTES = 20 * 1024 * 1024
 
-# Демо-картинка решения для /start (статический ассет).
 _DEMO_PATH = Path(__file__).parent / "assets" / "demo_solution.png"
 
 
+def _mode_cost(mode: str) -> int:
+    return settings.premium_cost if mode == "premium" else settings.standard_cost
+
+
+def _mode_label(mode: str) -> str:
+    return "💎 Премиум" if mode == "premium" else "⚡ Стандарт"
+
+
 # ─────────────────────── команды ───────────────────────
-
-async def _menu_kb(user_id: int, username: str | None):
-    """Меню с учётом текущего статуса юзера (Premium/admin → без кнопок покупки)."""
-    quota = await check_quota(user_id, username=username)
-    return main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin), quota
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -90,11 +120,11 @@ async def cmd_start(message: Message):
         language_code=user.language_code,
     )
     log_event(user.id, "start")
-    kb, _ = await _menu_kb(user.id, user.username)
+    kb = main_menu_keyboard(is_admin=is_admin(user.username))
     prefix = MSG_ADMIN_WELCOME if is_admin(user.username) else ""
-    await message.answer(prefix + MSG_START, reply_markup=kb)
+    start_body = MSG_START_FREE if settings.free_mode else MSG_START_CREDITS
+    await message.answer(prefix + start_body, reply_markup=kb)
 
-    # Демо-пример решения — чтобы юзер сразу понял что делать (кинуть фото).
     if _DEMO_PATH.exists():
         try:
             await message.answer_photo(FSInputFile(_DEMO_PATH), caption=MSG_DEMO_CAPTION)
@@ -106,30 +136,21 @@ async def cmd_start(message: Message):
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message):
-    user = message.from_user
-    kb, _ = await _menu_kb(user.id, user.username)
+    kb = main_menu_keyboard(is_admin=is_admin(message.from_user.username))
     await message.answer("Главное меню 👇", reply_markup=kb)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     user = message.from_user
-    kb, _ = await _menu_kb(user.id, user.username)
-    help_text = MSG_HELP
-    if is_admin(user.username):
-        help_text = f"{MSG_HELP}\n\n{MSG_ADMIN_HELP}"
-    await message.answer(help_text, reply_markup=kb)
+    base = MSG_HELP_FREE if settings.free_mode else MSG_HELP_CREDITS
+    help_text = f"{base}\n\n{MSG_ADMIN_HELP}" if is_admin(user.username) else base
+    await message.answer(help_text, reply_markup=main_menu_keyboard(is_admin=is_admin(user.username)))
 
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message):
     await _send_balance(message)
-
-
-@router.message(Command("subscribe"))
-async def cmd_subscribe(message: Message, bot: Bot):
-    """Алиас для покупки Premium через команду."""
-    await _start_premium_purchase(message, bot)
 
 
 # ─────────────────────── кнопки меню ───────────────────────
@@ -141,49 +162,20 @@ async def menu_balance(message: Message):
 
 @router.message(F.text == BTN_HELP)
 async def menu_help(message: Message):
-    await message.answer(MSG_HELP)
+    # Раньше тут всегда отдавался MSG_HELP_CREDITS — с пакетами/тарифами/звёздами.
+    # В free-mode это категорически нельзя.
+    await message.answer(MSG_HELP_FREE if settings.free_mode else MSG_HELP_CREDITS)
 
 
-@router.message(F.text == BTN_BUY_PACK)
-async def menu_buy_pack(message: Message, bot: Bot):
-    user = message.from_user
-    if is_admin(user.username):
-        await message.answer("👑 У тебя безлимит как у админа — покупки не нужны.")
+@router.message(F.text == BTN_BUY_CREDITS)
+async def menu_buy_credits(message: Message):
+    if settings.free_mode:
+        await message.answer("✨ Бот сейчас полностью бесплатный — пакеты не нужны.")
         return
-    quota = await check_quota(user.id, username=user.username)
-    if quota.is_premium:
-        until_str = quota.premium_until.strftime("%d.%m.%Y") if quota.premium_until else ""
-        kb = main_menu_keyboard(is_premium=True)
-        await message.answer(
-            f"💎 У тебя активен Premium до <b>{until_str}</b> — безлимит решений.\n"
-            f"Дополнительные пакеты не нужны.",
-            reply_markup=kb,
-        )
+    if is_admin(message.from_user.username):
+        await message.answer("👑 У тебя безлимит как у админа — кредиты не нужны.")
         return
-    await message.answer(MSG_BUY_PACK_PROMPT, reply_markup=pack_choice_keyboard())
-
-
-@router.message(F.text == BTN_BUY_PREMIUM)
-async def menu_buy_premium(message: Message, bot: Bot):
-    await _start_premium_purchase(message, bot)
-
-
-async def _start_premium_purchase(message: Message, bot: Bot):
-    user = message.from_user
-    if is_admin(user.username):
-        await message.answer("👑 У тебя уже безлимит как у админа.")
-        return
-    quota = await check_quota(user.id, username=user.username)
-    if quota.is_premium:
-        until_str = quota.premium_until.strftime("%d.%m.%Y") if quota.premium_until else ""
-        kb = main_menu_keyboard(is_premium=True)
-        await message.answer(
-            f"💎 Premium уже активен до <b>{until_str}</b>.\n"
-            f"Продлить можно после окончания срока.",
-            reply_markup=kb,
-        )
-        return
-    await message.answer(MSG_BUY_PREMIUM_PROMPT, reply_markup=premium_choice_keyboard())
+    await message.answer(MSG_BUY_CREDITS_PROMPT, reply_markup=packages_keyboard())
 
 
 async def _send_balance(message: Message):
@@ -192,12 +184,22 @@ async def _send_balance(message: Message):
         telegram_id=user.id, username=user.username,
         first_name=user.first_name, last_name=user.last_name,
     )
-    quota = await check_quota(user.id, username=user.username)
-    kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
-    await message.answer(msg_balance(quota), reply_markup=kb)
+    if settings.free_mode:
+        adm = is_admin(user.username)
+        used = 0 if adm else await get_daily_used(user.id)
+        await message.answer(
+            msg_balance_free(used, is_admin=adm),
+            reply_markup=main_menu_keyboard(is_admin=adm),
+        )
+        return
+    status = await get_credit_status(user.id, username=user.username)
+    await message.answer(
+        msg_balance_credits(status),
+        reply_markup=main_menu_keyboard(is_admin=status.is_admin),
+    )
 
 
-# ─────────────────────── фото → решение ───────────────────────
+# ─────────────────────── фото → выбор режима → решение ───────────────────────
 
 def _pdf_first_page_png(pdf_bytes: bytes) -> bytes:
     """Первая страница PDF → PNG (через poppler/pdf2image). Синхронно."""
@@ -226,161 +228,96 @@ def _make_status_cb(processing_msg: Message):
         try:
             await processing_msg.edit_text(text)
         except Exception:
-            # "message is not modified" и прочие — не критичны
             pass
     return cb
 
 
-async def _send_solution_result(
-    bot: Bot, chat_id: int, processing_msg: Message, result: dict,
-    *, caption: str, image_ref: dict | None = None, allow_resolve: bool = True,
-) -> None:
-    """Доставить решение: превью-фото первой страницы + полный PDF.
+async def _safe_notify(processing_msg: Message | None, fallback_msg: Message, text: str) -> None:
+    """Доставить юзеру MSG_ERROR/MSG_TIMEOUT в максимально устойчивом виде.
 
-    image_ref={"file_id","is_pdf","hint"} — нужен для кнопки «перерешать».
-    Квоту здесь НЕ списываем — это делает вызывающий (re-solve не списывает).
+    1) Если processing_msg создан — пробуем отредактировать его.
+    2) Если processing_msg=None (упал ещё до создания) ИЛИ edit упал — шлём новое.
+    3) Если и это упало — глотаем (юзер заблочил бота / 403). Лог уже был на месте вызова.
     """
-    latex_text = result.get("latex", "")
-    pdf_bytes = result.get("pdf")
-    png_bytes = result.get("png")
-
+    if processing_msg is not None:
+        try:
+            await processing_msg.edit_text(text)
+            return
+        except Exception:
+            pass
     try:
-        await processing_msg.delete()
-    except Exception:
-        pass
-
-    # Рендер упал целиком → отдаём LaTeX текстом (хоть что-то).
-    if not pdf_bytes and not png_bytes:
-        logger.warning("Render failed — sending LaTeX as text")
-        for ch in _split_for_telegram(latex_text or "Не удалось оформить решение."):
-            await bot.send_message(chat_id, f"<pre>{_escape_html(ch)}</pre>")
-        return
-
-    # Данные решения в Redis: latex для кнопки + (опц.) ссылка на фото для «перерешать».
-    token = secrets.token_urlsafe(8)
-    payload = {"latex": latex_text}
-    can_resolve = bool(allow_resolve and image_ref and image_ref.get("file_id"))
-    if can_resolve:
-        payload.update(image_ref)
-    await get_redis().set(f"sol:{token}", json.dumps(payload), ex=SOLUTION_TTL_SECONDS)
-    kb = solution_keyboard(token, allow_resolve=can_resolve)
-
-    if png_bytes and pdf_bytes:
-        # Превью первой страницы (быстрый взгляд) + полный PDF (чётко, целиком).
-        await bot.send_photo(
-            chat_id,
-            photo=BufferedInputFile(png_bytes, filename="preview.png"),
-            caption=caption,
-        )
-        await bot.send_document(
-            chat_id,
-            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
-            caption="📄 Полное решение — открой, чтобы увеличить и пролистать.",
-            reply_markup=kb,
-        )
-    elif pdf_bytes:
-        await bot.send_document(
-            chat_id,
-            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
-            caption=caption,
-            reply_markup=kb,
-        )
-    else:  # только превью-картинка
-        await bot.send_photo(
-            chat_id,
-            photo=BufferedInputFile(png_bytes, filename="solution.png"),
-            caption=caption,
-            reply_markup=kb,
-        )
+        await fallback_msg.answer(text)
+    except Exception as e:
+        logger.warning(f"_safe_notify: both edit and answer failed: {e}")
 
 
-async def _solve_incoming(
-    message: Message, bot: Bot, file_id: str, is_pdf: bool, caption: str,
+async def _present_modes(
+    message: Message, bot: Bot, file_id: str, is_pdf: bool, hint: str,
 ) -> None:
-    """Единый поток: фото или документ → решение. Лимиты, квота, статус, доставка."""
-    user = message.from_user
-    user_id = user.id
-    username = user.username
+    """Фото/документ получены.
 
+    Free-mode: проверяем daily cap → сразу решаем как standard (бесплатно).
+    Credit-mode: сохраняем в Redis, предлагаем выбрать режим.
+    """
+    user = message.from_user
     await get_or_create_user(
-        telegram_id=user_id, username=username,
+        telegram_id=user.id, username=user.username,
         first_name=user.first_name, last_name=user.last_name,
     )
 
-    if not await check_rate_limit(user_id):
+    if not await check_rate_limit(user.id):
         await message.answer("⏱ Слишком быстро! Подожди минутку и попробуй снова.")
         return
 
-    quota = await check_quota(user_id, username=username)
-    if not quota.allowed:
-        if quota.reason == "premium_daily_cap":
-            await message.answer(MSG_PREMIUM_CAP)
+    # ── FREE MODE ── ничего не списываем, без выбора режима.
+    if settings.free_mode:
+        adm = is_admin(user.username)
+        if not adm:
+            ok, _used = await check_daily_cap(user.id, settings.free_daily_cap)
+            if not ok:
+                await message.answer(MSG_DAILY_CAP_REACHED)
+                return
+        # Inflight-lock ставим ДО pipeline. Если юзер шлёт повторно, пока первая
+        # задача в работе — отбиваем без AI-вызовов (экономия 0.5-2₽ на retry).
+        if not await try_acquire_inflight(user.id):
+            await message.answer(MSG_INFLIGHT)
             return
-        kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
-        log_event(user_id, "paywall_shown")
-        await message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
-        return
-
-    try:
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-
-    try:
-        image_bytes = await _download_image(bot, file_id, is_pdf)
-    except Exception as e:
-        logger.warning(f"download/convert failed for {user_id}: {e}")
-        await message.answer("😔 Не смог открыть файл. Пришли фото или PDF задачи ещё раз.")
-        return
-
-    processing_msg = await message.answer(MSG_PROCESSING)
-
-    try:
-        result = await solve_task_from_photo(
-            image_bytes, user_id=user_id, user_hint=caption,
-            on_status=_make_status_cb(processing_msg),
-        )
-
-        # Несколько задач и подписи нет → спрашиваем какую решать (квоту НЕ списываем).
-        if result.get("needs_choice"):
-            task_ids = result["task_ids"]
-            token = secrets.token_urlsafe(8)
-            await get_redis().set(
-                f"taskpick:{token}",
-                json.dumps({"file_id": file_id, "is_pdf": is_pdf, "task_ids": task_ids}),
-                ex=TASKPICK_TTL_SECONDS,
-            )
-            try:
-                await processing_msg.delete()
-            except Exception:
-                pass
-            await message.answer(
-                msg_choose_task(task_ids),
-                reply_markup=task_choice_keyboard(token, task_ids),
-            )
-            return
-
-        await _send_solution_result(
-            bot, message.chat.id, processing_msg, result,
-            caption=_build_solution_caption(quota),
-            image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": caption},
-            allow_resolve=True,
-        )
-        await consume_quota(user_id, username=username)
-        log_event(user_id, "solve")
-
-    except Exception as e:
-        logger.exception(f"Pipeline error for user {user_id}: {e}")
         try:
-            await processing_msg.edit_text(MSG_ERROR)
-        except Exception:
-            await message.answer(MSG_ERROR)
+            # MSG_PROCESSING внутри try: если Telegram упадёт (юзер заблочил бота
+            # между апдейтами / 429) — finally всё равно снимет inflight-лок.
+            processing_msg = await message.answer(MSG_PROCESSING)
+            await _run_solve(
+                bot, message.chat.id, processing_msg, user,
+                file_id, is_pdf, hint, mode="standard", cost=0,
+                status=CreditStatus(is_admin=adm),
+            )
+        finally:
+            await release_inflight(user.id)
+        return
+
+    # ── CREDIT MODE ──
+    status = await get_credit_status(user.id, username=user.username)
+    if not status.is_admin and status.credits < settings.standard_cost:
+        log_event(user.id, "paywall_shown")
+        await message.answer(
+            msg_insufficient_credits(status.credits, settings.standard_cost),
+            reply_markup=packages_keyboard(),
+        )
+        return
+
+    token = secrets.token_urlsafe(8)
+    await get_redis().set(
+        f"pend:{token}",
+        json.dumps({"file_id": file_id, "is_pdf": is_pdf, "hint": hint}),
+        ex=PENDING_TTL_SECONDS,
+    )
+    await message.answer(msg_mode_prompt(status), reply_markup=mode_choice_keyboard(token))
 
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     logger.info(f"Photo from {message.from_user.id} @{message.from_user.username}")
-    await _solve_incoming(
+    await _present_modes(
         message, bot, message.photo[-1].file_id, False, (message.caption or "").strip(),
     )
 
@@ -398,27 +335,179 @@ async def handle_document(message: Message, bot: Bot):
         await message.answer("⚠️ Файл слишком большой (макс 20 МБ). Пришли фото или PDF поменьше.")
         return
     logger.info(f"Document from {message.from_user.id} mime={mime}")
-    await _solve_incoming(message, bot, doc.file_id, is_pdf, (message.caption or "").strip())
+    await _present_modes(message, bot, doc.file_id, is_pdf, (message.caption or "").strip())
+
+
+def _caption(status, mode: str, cost: int) -> str:
+    if status.is_admin:
+        return "✅ Готово · 👑 админ"
+    if settings.free_mode:
+        return "✅ Готово · ✨ бесплатно"
+    label = _mode_label(mode)
+    left = max(0, status.credits - cost)
+    return f"✅ Готово · {label} (−{cost}). Кредитов осталось: {left}"
+
+
+async def _run_solve(
+    bot: Bot, chat_id: int, processing_msg: Message, user,
+    file_id: str, is_pdf: bool, hint: str, mode: str, cost: int, status,
+) -> None:
+    """Скачать, решить выбранным режимом, доставить, списать кредиты.
+
+    Списание — только после успешной доставки. needs_choice/ocr_failed не списывают.
+    """
+    try:
+        image_bytes = await _download_image(bot, file_id, is_pdf)
+    except Exception as e:
+        logger.warning(f"download/convert failed for {user.id}: {e}")
+        try:
+            await processing_msg.edit_text("😔 Не смог открыть файл. Пришли фото или PDF задачи ещё раз.")
+        except Exception:
+            await bot.send_message(chat_id, "😔 Не смог открыть файл. Пришли фото или PDF задачи ещё раз.")
+        return
+
+    try:
+        result = await solve_task_from_photo(
+            image_bytes, user_id=user.id, user_hint=hint,
+            on_status=_make_status_cb(processing_msg), mode=mode,
+        )
+
+        # Несколько задач без подсказки → спрашиваем какую (режим переносим в payload).
+        if result.get("needs_choice"):
+            task_ids = result["task_ids"]
+            token = secrets.token_urlsafe(8)
+            await get_redis().set(
+                f"taskpick:{token}",
+                json.dumps({"file_id": file_id, "is_pdf": is_pdf, "task_ids": task_ids, "mode": mode}),
+                ex=TASKPICK_TTL_SECONDS,
+            )
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            await bot.send_message(
+                chat_id, msg_choose_task(task_ids),
+                reply_markup=task_choice_keyboard(token, task_ids),
+            )
+            return
+
+        # Standard не смог распознать условие → кредиты не списываем.
+        if result.get("ocr_failed"):
+            try:
+                await processing_msg.edit_text(MSG_OCR_FAILED_STANDARD)
+            except Exception:
+                await bot.send_message(chat_id, MSG_OCR_FAILED_STANDARD)
+            return
+
+        await _send_solution_result(
+            bot, chat_id, processing_msg, result,
+            caption=_caption(status, mode, cost),
+            image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": hint, "mode": mode},
+            allow_resolve=True,
+        )
+        if settings.free_mode:
+            await bump_daily_used(user.id, username=user.username)
+        else:
+            await consume_credits(user.id, cost, username=user.username)
+        log_event(user.id, "solve")
+
+    except _LLM_TIMEOUT_EXCS as e:
+        # Кредиты/daily_used не списываем — провайдер не ответил, юзер не виноват.
+        logger.warning(
+            f"LLM timeout for user {user.id} (@{user.username}): "
+            f"{type(e).__name__}: {e}"
+        )
+        try:
+            await processing_msg.edit_text(MSG_TIMEOUT)
+        except Exception:
+            await bot.send_message(chat_id, MSG_TIMEOUT)
+    except Exception as e:
+        logger.exception(f"Pipeline error for user {user.id}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_ERROR)
+        except Exception:
+            await bot.send_message(chat_id, MSG_ERROR)
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def handle_mode(callback: CallbackQuery, bot: Bot):
+    """Юзер выбрал режим решения — проверяем баланс и решаем."""
+    # Ack callback СРАЗУ: любая задержка ~>10c → TelegramBadRequest "query is too old"
+    # и /webhook отдаёт 500 → TG ретраит → лавина 500. Алерты доставляем через
+    # message.answer() ниже.
+    try:
+        await callback.answer()
+    except Exception as e:
+        logger.warning(f"callback.answer (mode) skipped: {e}")
+
+    parts = callback.data.split(":")  # ["mode", token, "standard"|"premium"]
+    if len(parts) != 3:
+        return
+    token, mode = parts[1], parts[2]
+
+    raw = await get_redis().get(f"pend:{token}")
+    if not raw:
+        await callback.message.answer("Выбор устарел (хранится 1 час). Пришли фото снова.")
+        return
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)
+
+    user = callback.from_user
+    cost = _mode_cost(mode)
+    status = await get_credit_status(user.id, username=user.username)
+    if not status.can_afford(cost):
+        log_event(user.id, "paywall_shown")
+        await callback.message.answer(
+            msg_insufficient_credits(status.credits, cost),
+            reply_markup=packages_keyboard(),
+        )
+        return
+
+    if not await check_rate_limit(user.id):
+        await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
+        return
+
+    # Inflight-lock — защита от двойного клика «Стандарт/Премиум» (Telegram иногда
+    # дублирует callback при флапе сети). Один pipeline на юзера за раз.
+    if not await try_acquire_inflight(user.id):
+        await callback.message.answer(MSG_INFLIGHT)
+        return
+
+    await get_redis().delete(f"pend:{token}")
+
+    processing_msg = callback.message
+    try:
+        await processing_msg.edit_text(f"{_mode_label(mode)} · {MSG_PROCESSING}")
+    except Exception:
+        processing_msg = await callback.message.answer(MSG_PROCESSING)
+
+    try:
+        await _run_solve(
+            bot, callback.message.chat.id, processing_msg, user,
+            data["file_id"], data.get("is_pdf", False), data.get("hint", ""), mode, cost, status,
+        )
+    finally:
+        await release_inflight(user.id)
 
 
 @router.callback_query(F.data.startswith("pick:"))
 async def handle_pick_task(callback: CallbackQuery, bot: Bot):
-    """Юзер выбрал, какую из нескольких задач на фото решить."""
-    user = callback.from_user
-    user_id = user.id
-    username = user.username
+    """Юзер выбрал, какую из нескольких задач решить (режим уже выбран ранее)."""
+    # Ack callback СРАЗУ — см. handle_mode выше.
+    try:
+        await callback.answer()
+    except Exception as e:
+        logger.warning(f"callback.answer (pick) skipped: {e}")
 
     parts = callback.data.split(":")  # ["pick", token, idx]
     if len(parts) != 3:
-        await callback.answer()
         return
     token, idx_str = parts[1], parts[2]
 
     raw = await get_redis().get(f"taskpick:{token}")
     if not raw:
-        await callback.answer(
-            "Выбор устарел (хранится 1 час). Пришли фото снова.", show_alert=True,
-        )
+        await callback.message.answer("Выбор устарел (хранится 1 час). Пришли фото снова.")
         return
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
@@ -426,79 +515,99 @@ async def handle_pick_task(callback: CallbackQuery, bot: Bot):
     task_ids = data.get("task_ids", [])
     file_id = data.get("file_id")
     is_pdf = data.get("is_pdf", False)
+    mode = data.get("mode", "premium")
 
     try:
         idx = int(idx_str)
     except ValueError:
         idx = 0
     if not (0 <= idx < len(task_ids)) or not file_id:
-        await callback.answer("Что-то пошло не так, пришли фото снова.", show_alert=True)
+        await callback.message.answer("Что-то пошло не так, пришли фото снова.")
         return
     chosen = task_ids[idx]
 
-    # Лимиты/квота проверяем на момент выбора.
-    if not await check_rate_limit(user_id):
-        await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
+    user = callback.from_user
+    cost = _mode_cost(mode)
+    status = await get_credit_status(user.id, username=user.username)
+    if not status.can_afford(cost):
+        log_event(user.id, "paywall_shown")
+        await callback.message.answer(
+            msg_insufficient_credits(status.credits, cost),
+            reply_markup=packages_keyboard(),
+        )
         return
-    quota = await check_quota(user_id, username=username)
-    if not quota.allowed:
-        await callback.answer()
-        if quota.reason == "premium_daily_cap":
-            await callback.message.answer(MSG_PREMIUM_CAP)
-            return
-        kb = main_menu_keyboard(is_premium=quota.is_premium, is_admin=quota.is_admin)
-        log_event(user_id, "paywall_shown")
-        await callback.message.answer(msg_quota_exceeded(quota.free_resets_at), reply_markup=kb)
+    if not await check_rate_limit(user.id):
+        await callback.message.answer("⏱ Слишком быстро, подожди минутку.")
         return
 
-    await callback.answer()  # убрать "часики" на кнопке
-    await get_redis().delete(f"taskpick:{token}")  # выбор одноразовый
+    # Inflight-lock (см. handle_mode). Защита от двойного клика на pick-кнопке.
+    if not await try_acquire_inflight(user.id):
+        await callback.message.answer(MSG_INFLIGHT)
+        return
 
-    # Сообщение-вопрос превращаем в статус-сообщение (убираем кнопки).
+    await get_redis().delete(f"taskpick:{token}")
+
     processing_msg = callback.message
     try:
-        await processing_msg.edit_text(f"✅ Решаю задачу <b>№{chosen}</b>…")
+        await processing_msg.edit_text(f"{_mode_label(mode)} · ✅ Решаю задачу <b>№{chosen}</b>…")
     except Exception:
         processing_msg = await callback.message.answer(MSG_PROCESSING)
 
     hint = f"реши задачу №{chosen}"
     try:
-        image_bytes = await _download_image(bot, file_id, is_pdf)
-        result = await solve_task_from_photo(
-            image_bytes, user_id=user_id, user_hint=hint,
-            on_status=_make_status_cb(processing_msg),
+        await _run_solve(
+            bot, callback.message.chat.id, processing_msg, user,
+            file_id, is_pdf, hint, mode, cost, status,
         )
-        await _send_solution_result(
-            bot, callback.message.chat.id, processing_msg, result,
-            caption=_build_solution_caption(quota),
-            image_ref={"file_id": file_id, "is_pdf": is_pdf, "hint": hint},
-            allow_resolve=True,
-        )
-        await consume_quota(user_id, username=username)
-    except Exception as e:
-        logger.exception(f"Pick-task pipeline error for user {user_id}: {e}")
-        try:
-            await processing_msg.edit_text(MSG_ERROR)
-        except Exception:
-            await callback.message.answer(MSG_ERROR)
+    finally:
+        await release_inflight(user.id)
 
 
-def _build_solution_caption(quota) -> str:
-    if quota.is_admin:
-        return "✅ Готово · 👑 админ"
-    if quota.is_premium:
-        return "✅ Готово · 💎 Premium"
-    # Списываем сначала credits, потом free — покажем что останется
-    if quota.credits > 0:
-        remaining = quota.credits - 1
-        return f"✅ Готово · купленных задач осталось: {remaining}"
-    remaining_after = max(0, quota.free_remaining - 1)
-    if remaining_after == 0:
-        return (
-            "✅ Готово · бесплатные решения закончились.\n"
-            "Выбери в меню пакет 79⭐ или Premium 149⭐"
+async def _send_solution_result(
+    bot: Bot, chat_id: int, processing_msg: Message, result: dict,
+    *, caption: str, image_ref: dict | None = None, allow_resolve: bool = True,
+) -> None:
+    """Доставить решение: превью-фото первой страницы + полный PDF.
+
+    image_ref={"file_id","is_pdf","hint","mode"} — нужен для кнопки «перерешать».
+    Кредиты здесь НЕ списываем — это делает вызывающий (re-solve не списывает).
+    """
+    latex_text = result.get("latex", "")
+    pdf_bytes = result.get("pdf")
+    png_bytes = result.get("png")
+
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    if not pdf_bytes and not png_bytes:
+        # До этой ветки доходим только если даже verbatim-рендер сломался
+        # (значит сама TeX-машина на сервере не работает). Юзеру в чат
+        # бесполезно слать LaTeX-исходник — это его никак не спасёт.
+        logger.error("ALL render tiers failed (verbatim too) — sending error msg")
+        await bot.send_message(
+            chat_id,
+            "😔 Сейчас не получается оформить PDF. Попробуй ещё раз через минуту "
+            "или напиши @manag31.",
         )
-    return f"✅ Готово · осталось {remaining_after}/{settings.free_tasks_per_week} бесплатных на неделю"
+        return
+
+    # Одно сообщение: PDF с подписью. Никаких inline-кнопок —
+    # юзеру нужно решение, а не действия над ним.
+    if pdf_bytes:
+        await bot.send_document(
+            chat_id,
+            document=BufferedInputFile(pdf_bytes, filename="solution.pdf"),
+            caption=caption,
+        )
+    elif png_bytes:
+        # Очень редкий fallback: PDF не получился, есть только превью PNG.
+        await bot.send_photo(
+            chat_id,
+            photo=BufferedInputFile(png_bytes, filename="solution.png"),
+            caption=caption,
+        )
 
 
 async def _load_sol(token: str) -> dict | None:
@@ -514,29 +623,10 @@ async def _load_sol(token: str) -> dict | None:
         return None
 
 
-@router.callback_query(F.data.startswith("latex:"))
-async def handle_show_latex(callback: CallbackQuery):
-    token = callback.data.removeprefix("latex:")
-    data = await _load_sol(token)
-    latex_text = (data or {}).get("latex")
-
-    if not latex_text:
-        await callback.answer(
-            "LaTeX недоступен (хранится 1 час). Кинь задачу снова.",
-            show_alert=True,
-        )
-        return
-
-    for ch in _split_for_telegram(latex_text, max_len=3500):
-        await callback.message.answer(f"<pre>{_escape_html(ch)}</pre>", parse_mode="HTML")
-    await callback.answer("LaTeX отправлен — можно копировать")
-
-
 @router.callback_query(F.data.startswith("resolve:"))
 async def handle_resolve(callback: CallbackQuery, bot: Bot):
-    """«Перерешать» — одна бесплатная попытка на решение, мимо кэша, с thinking."""
+    """«Перерешать» — одна бесплатная попытка на решение, мимо кэша, в том же режиме."""
     user = callback.from_user
-    user_id = user.id
 
     token = callback.data.removeprefix("resolve:")
     data = await _load_sol(token)
@@ -547,61 +637,145 @@ async def handle_resolve(callback: CallbackQuery, bot: Bot):
         )
         return
 
-    if not await check_rate_limit(user_id):
+    if not await check_rate_limit(user.id):
         await callback.answer("⏱ Слишком быстро, подожди минутку.", show_alert=True)
         return
 
+    # Inflight-lock: «перерешать» — тоже полный pipeline. Без лока двойной клик
+    # на кнопку = двойная оплата Sonnet.
+    if not await try_acquire_inflight(user.id):
+        await callback.answer("⏳ Дождись завершения текущего решения.", show_alert=True)
+        return
+
     await callback.answer("🔄 Перерешиваю заново…")
-    await get_redis().delete(f"sol:{token}")  # одноразово — одна бесплатная попытка
+    await get_redis().delete(f"sol:{token}")
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)  # снять кнопки со старого
+        await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
+    mode = data.get("mode", "premium")
     processing_msg = await callback.message.answer("🔄 Решаю заново, перепроверяю вычисления…")
     hint = (data.get("hint") or "").strip()
     resolve_hint = (hint + " Перепроверь вычисления, реши заново внимательно.").strip()
     try:
         image_bytes = await _download_image(bot, data["file_id"], data.get("is_pdf", False))
         result = await solve_task_from_photo(
-            image_bytes, user_id=user_id, user_hint=resolve_hint,
+            image_bytes, user_id=user.id, user_hint=resolve_hint,
             on_status=_make_status_cb(processing_msg),
-            skip_cache=True, force_thinking=True,
+            skip_cache=True, mode=mode,
         )
-        # Re-solve бесплатный → квоту НЕ списываем, и повторную кнопку не вешаем.
+        if result.get("ocr_failed") or result.get("needs_choice"):
+            try:
+                await processing_msg.edit_text("Не удалось перерешать автоматически — пришли фото задачи снова.")
+            except Exception:
+                pass
+            return
+        # Re-solve бесплатный → кредиты НЕ списываем, повторную кнопку не вешаем.
         await _send_solution_result(
             bot, callback.message.chat.id, processing_msg, result,
-            caption="🔄 Готово — перерешано заново (квота не списана).",
+            caption="🔄 Готово — перерешано заново (кредиты не списаны).",
             allow_resolve=False,
         )
+    except _LLM_TIMEOUT_EXCS as e:
+        logger.warning(f"LLM timeout (resolve) for user {user.id}: {type(e).__name__}: {e}")
+        try:
+            await processing_msg.edit_text(MSG_TIMEOUT)
+        except Exception:
+            await callback.message.answer(MSG_TIMEOUT)
     except Exception as e:
-        logger.exception(f"Resolve error for user {user_id}: {e}")
+        logger.exception(f"Resolve error for user {user.id}: {e}")
         try:
             await processing_msg.edit_text(MSG_ERROR)
         except Exception:
             await callback.message.answer(MSG_ERROR)
-
-
-@router.callback_query(F.data == "renew_premium")
-async def handle_renew_premium(callback: CallbackQuery, bot: Bot):
-    """Кнопка «Продлить Premium» из уведомления об окончании подписки."""
-    if is_admin(callback.from_user.username):
-        await callback.answer("👑 У тебя безлимит как у админа.", show_alert=True)
-        return
-    await callback.answer()
-    await callback.message.answer(MSG_BUY_PREMIUM_PROMPT, reply_markup=premium_choice_keyboard())
+    finally:
+        await release_inflight(user.id)
 
 
 @router.message(F.text)
-async def handle_text(message: Message):
-    """Любой текст не из меню — подсказка."""
+async def handle_text(message: Message, bot: Bot):
+    """Любой текстовый ввод (не команда, не кнопка меню).
+
+    Free-mode: пускаем через Haiku-гейт (математика/физика?). Если да — решаем
+    текстовый ввод напрямую через DeepSeek. Если нет — вежливый отказ.
+    Credit-mode: подсказка прислать фото (мы не делаем text-input платным сейчас).
+    """
     user = message.from_user
-    kb, _ = await _menu_kb(user.id, user.username)
-    await message.answer(
-        "📸 Кинь <b>фото</b> задачи — решу пошагово.\n"
-        "Или выбери из меню под клавиатурой 👇",
-        reply_markup=kb,
+    text = (message.text or "").strip()
+
+    if not settings.free_mode:
+        kb = main_menu_keyboard(is_admin=is_admin(user.username))
+        await message.answer(
+            "📸 Кинь <b>фото</b> задачи — предложу выбрать режим и решу.\n"
+            "Или выбери из меню под клавиатурой 👇",
+            reply_markup=kb,
+        )
+        return
+
+    # FREE MODE: пробуем как math/physics задачу.
+    await get_or_create_user(
+        telegram_id=user.id, username=user.username,
+        first_name=user.first_name, last_name=user.last_name,
     )
+    if not await check_rate_limit(user.id):
+        await message.answer("⏱ Слишком быстро! Подожди минутку.")
+        return
+
+    adm = is_admin(user.username)
+    if not adm:
+        ok, _used = await check_daily_cap(user.id, settings.free_daily_cap)
+        if not ok:
+            await message.answer(MSG_DAILY_CAP_REACHED)
+            return
+
+    # Гейт темы (Haiku) — отсекаем не-математику/физику.
+    if settings.topic_gate_enabled:
+        is_math = await is_math_or_physics(text)
+        if not is_math:
+            await message.answer(MSG_NOT_MATH)
+            return
+
+    # Inflight-lock: см. _present_modes. Особенно критично для текстового пути —
+    # юзер может вбивать одну задачу 5 раз подряд за минуту.
+    if not await try_acquire_inflight(user.id):
+        await message.answer(MSG_INFLIGHT)
+        return
+
+    # Инициализируем processing_msg до try-блока на случай если message.answer упадёт
+    # внутри (Telegram 429 / юзер заблокировал) — иначе NameError в except-ветках.
+    processing_msg: Message | None = None
+    try:
+        processing_msg = await message.answer(MSG_TEXT_PROCESSING)
+        result = await solve_task_from_text(
+            condition_text=text, user_id=user.id,
+            on_status=_make_status_cb(processing_msg),
+        )
+        if result.get("empty_input"):
+            try:
+                await processing_msg.edit_text("📝 Условие слишком короткое — пришли больше деталей.")
+            except Exception:
+                pass
+            return
+        await _send_solution_result(
+            bot, message.chat.id, processing_msg, result,
+            caption=_caption(CreditStatus(is_admin=adm), "standard", 0),
+            image_ref=None, allow_resolve=False,  # для text-input «перерешать» пока не делаем
+        )
+        await bump_daily_used(user.id, username=user.username)
+        log_event(user.id, "solve")
+    except _LLM_TIMEOUT_EXCS as e:
+        # Daily_used не списываем — провайдер не ответил.
+        logger.warning(
+            f"LLM timeout (text-solve) for user {user.id} (@{user.username}): "
+            f"{type(e).__name__}: {e}"
+        )
+        await _safe_notify(processing_msg, message, MSG_TIMEOUT)
+    except Exception as e:
+        logger.exception(f"text-solve error for user {user.id}: {e}")
+        await _safe_notify(processing_msg, message, MSG_ERROR)
+    finally:
+        await release_inflight(user.id)
 
 
 # ─── утилиты ──────────────────────────────────────────────────────────

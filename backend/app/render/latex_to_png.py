@@ -9,6 +9,7 @@ Dockerfile-зависимости: texlive-latex-* + texlive-extra-utils (pdfcro
 import asyncio
 import hashlib
 import io
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,9 +20,15 @@ from loguru import logger
 CACHE_DIR = Path("/app/render_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Параноидальный режим TeX для компиляции НЕДОВЕРЕННОГО (LLM) LaTeX: чтение/запись
+# файлов разрешены ТОЛЬКО в текущем каталоге (openin_any=p / openout_any=p) — это
+# блокирует LFI вида \input{/app/.env}/\openin произвольного пути и эксфильтрацию
+# через PDF. PATH и прочее наследуем от родителя. Используется во ВСЕХ pdflatex.
+_TEX_SAFE_ENV = {**os.environ, "openin_any": "p", "openout_any": "p"}
+
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
-TEMPLATE_VERSION = "v8"
+TEMPLATE_VERSION = "v9"
 
 # Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
 # высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
@@ -32,9 +39,14 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 \usepackage[russian]{babel}
 \usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
 \usepackage{mathrsfs}  % \mathscr — сигма-алгебры/нотация тервера (часто у Claude)
+\usepackage{bm}        % \bm — жирные символы (модель часто использует)
+\usepackage{cancel}    % \cancel — зачёркивание в выкладках
+\usepackage{siunitx}   % \si/\SI — единицы СИ (физика)
+\usepackage{graphicx}  % \includegraphics — вставка отрендеренных рисунков (figures.py)
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{enumitem}
+\usepackage{newunicodechar}
 \geometry{paperwidth=16cm,paperheight=22cm,margin=0.6cm,top=0.8cm,bottom=0.8cm}
 \pagenumbering{gobble}
 \setlength{\parindent}{0pt}
@@ -44,6 +56,122 @@ LATEX_TEMPLATE = r"""\documentclass[12pt]{article}
 % более свободные переносы (\sloppy), чтобы текст не вылезал за край.
 \setlength{\emergencystretch}{3em}
 \sloppy
+
+% ── Карта литеральных Unicode-символов → корректные LaTeX-команды. ──────────
+% Модели часто вставляют символы напрямую (≤ ∫ → ∞ ℝ α …). Под T2A без этой
+% карты они фатальны («Unicode character not allowed»). \ensuremath работает и
+% в text-, и в math-режиме. Это детерминированно убирает целый класс падений.
+\newunicodechar{≤}{\ensuremath{\le}}
+\newunicodechar{≥}{\ensuremath{\ge}}
+\newunicodechar{≠}{\ensuremath{\ne}}
+\newunicodechar{≈}{\ensuremath{\approx}}
+\newunicodechar{≡}{\ensuremath{\equiv}}
+\newunicodechar{≅}{\ensuremath{\cong}}
+\newunicodechar{≃}{\ensuremath{\simeq}}
+\newunicodechar{∼}{\ensuremath{\sim}}
+\newunicodechar{±}{\ensuremath{\pm}}
+\newunicodechar{∓}{\ensuremath{\mp}}
+\newunicodechar{×}{\ensuremath{\times}}
+\newunicodechar{÷}{\ensuremath{\div}}
+\newunicodechar{·}{\ensuremath{\cdot}}
+\newunicodechar{∘}{\ensuremath{\circ}}
+\newunicodechar{∗}{\ensuremath{\ast}}
+\newunicodechar{∝}{\ensuremath{\propto}}
+\newunicodechar{→}{\ensuremath{\to}}
+\newunicodechar{←}{\ensuremath{\leftarrow}}
+\newunicodechar{↔}{\ensuremath{\leftrightarrow}}
+\newunicodechar{⇒}{\ensuremath{\Rightarrow}}
+\newunicodechar{⇐}{\ensuremath{\Leftarrow}}
+\newunicodechar{⇔}{\ensuremath{\Leftrightarrow}}
+\newunicodechar{↦}{\ensuremath{\mapsto}}
+\newunicodechar{∞}{\ensuremath{\infty}}
+\newunicodechar{∂}{\ensuremath{\partial}}
+\newunicodechar{∇}{\ensuremath{\nabla}}
+\newunicodechar{∫}{\ensuremath{\int}}
+\newunicodechar{∮}{\ensuremath{\oint}}
+\newunicodechar{∑}{\ensuremath{\sum}}
+\newunicodechar{∏}{\ensuremath{\prod}}
+\newunicodechar{√}{\ensuremath{\surd}}
+\newunicodechar{∈}{\ensuremath{\in}}
+\newunicodechar{∉}{\ensuremath{\notin}}
+\newunicodechar{∋}{\ensuremath{\ni}}
+\newunicodechar{⊂}{\ensuremath{\subset}}
+\newunicodechar{⊆}{\ensuremath{\subseteq}}
+\newunicodechar{⊃}{\ensuremath{\supset}}
+\newunicodechar{⊇}{\ensuremath{\supseteq}}
+\newunicodechar{∪}{\ensuremath{\cup}}
+\newunicodechar{∩}{\ensuremath{\cap}}
+\newunicodechar{∅}{\ensuremath{\varnothing}}
+\newunicodechar{∀}{\ensuremath{\forall}}
+\newunicodechar{∃}{\ensuremath{\exists}}
+\newunicodechar{∄}{\ensuremath{\nexists}}
+\newunicodechar{¬}{\ensuremath{\neg}}
+\newunicodechar{∧}{\ensuremath{\wedge}}
+\newunicodechar{∨}{\ensuremath{\vee}}
+\newunicodechar{⊕}{\ensuremath{\oplus}}
+\newunicodechar{⊗}{\ensuremath{\otimes}}
+\newunicodechar{∣}{\ensuremath{\mid}}
+\newunicodechar{∥}{\ensuremath{\parallel}}
+\newunicodechar{⊥}{\ensuremath{\perp}}
+\newunicodechar{∠}{\ensuremath{\angle}}
+\newunicodechar{°}{\ensuremath{^\circ}}
+\newunicodechar{′}{\ensuremath{{}^\prime}}
+\newunicodechar{…}{\ensuremath{\ldots}}
+\newunicodechar{⋯}{\ensuremath{\cdots}}
+\newunicodechar{⟨}{\ensuremath{\langle}}
+\newunicodechar{⟩}{\ensuremath{\rangle}}
+\newunicodechar{ℝ}{\ensuremath{\mathbb{R}}}
+\newunicodechar{ℕ}{\ensuremath{\mathbb{N}}}
+\newunicodechar{ℤ}{\ensuremath{\mathbb{Z}}}
+\newunicodechar{ℚ}{\ensuremath{\mathbb{Q}}}
+\newunicodechar{ℂ}{\ensuremath{\mathbb{C}}}
+\newunicodechar{α}{\ensuremath{\alpha}}
+\newunicodechar{β}{\ensuremath{\beta}}
+\newunicodechar{γ}{\ensuremath{\gamma}}
+\newunicodechar{δ}{\ensuremath{\delta}}
+\newunicodechar{ε}{\ensuremath{\varepsilon}}
+\newunicodechar{ζ}{\ensuremath{\zeta}}
+\newunicodechar{η}{\ensuremath{\eta}}
+\newunicodechar{θ}{\ensuremath{\theta}}
+\newunicodechar{κ}{\ensuremath{\kappa}}
+\newunicodechar{λ}{\ensuremath{\lambda}}
+\newunicodechar{μ}{\ensuremath{\mu}}
+\newunicodechar{ν}{\ensuremath{\nu}}
+\newunicodechar{ξ}{\ensuremath{\xi}}
+\newunicodechar{π}{\ensuremath{\pi}}
+\newunicodechar{ρ}{\ensuremath{\rho}}
+\newunicodechar{σ}{\ensuremath{\sigma}}
+\newunicodechar{τ}{\ensuremath{\tau}}
+\newunicodechar{φ}{\ensuremath{\varphi}}
+\newunicodechar{χ}{\ensuremath{\chi}}
+\newunicodechar{ψ}{\ensuremath{\psi}}
+\newunicodechar{ω}{\ensuremath{\omega}}
+\newunicodechar{Δ}{\ensuremath{\Delta}}
+\newunicodechar{Γ}{\ensuremath{\Gamma}}
+\newunicodechar{Θ}{\ensuremath{\Theta}}
+\newunicodechar{Λ}{\ensuremath{\Lambda}}
+\newunicodechar{Ξ}{\ensuremath{\Xi}}
+\newunicodechar{Π}{\ensuremath{\Pi}}
+\newunicodechar{Σ}{\ensuremath{\Sigma}}
+\newunicodechar{Φ}{\ensuremath{\Phi}}
+\newunicodechar{Ψ}{\ensuremath{\Psi}}
+\newunicodechar{Ω}{\ensuremath{\Omega}}
+
+% ── Страховка от галлюцинируемых команд (не из подключённых пакетов). ───────
+% \providecommand определяет ТОЛЬКО если команда ещё не существует — не ломает
+% уже определённые. Без этого «\R», «\abs» и т.п. → «undefined control sequence».
+\providecommand{\R}{\mathbb{R}}
+\providecommand{\N}{\mathbb{N}}
+\providecommand{\Z}{\mathbb{Z}}
+\providecommand{\Q}{\mathbb{Q}}
+\providecommand{\C}{\mathbb{C}}
+\providecommand{\abs}[1]{\left|#1\right|}
+\providecommand{\norm}[1]{\left\|#1\right\|}
+\providecommand{\sgn}{\operatorname{sgn}}
+\providecommand{\rank}{\operatorname{rank}}
+\providecommand{\tr}{\operatorname{tr}}
+\providecommand{\diag}{\operatorname{diag}}
+\providecommand{\degree}{^\circ}
 
 \definecolor{accent}{HTML}{1d4ed8}
 \definecolor{accentline}{HTML}{a5b4fc}
@@ -87,11 +215,19 @@ def _content_hash(latex: str) -> str:
 # DPI превью первой страницы (выше = чётче формулы; 300 ≈ 1654px по ширине 14см).
 PREVIEW_DPI = 300
 
+# Без -halt-on-error pdflatex восстанавливается после нефатальных ошибок и всё
+# равно отдаёт PDF — это почти всегда ЛУЧШЕ plain-фолбэка (сохраняется вёрстка
+# + вставленный рисунок). Поэтому порог высокий: отдаём recovered-PDF как есть,
+# в fix-chain уходим только при ЯВНОМ мусоре (десятки ошибок). Раньше порог был
+# 6 — годный 5-страничный PDF выбрасывался в уродливый plain (и терял рисунок).
+_MAX_RECOVERABLE_TEX_ERRORS = 25
 
-def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
+
+def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
     """Синхронно: latex → pdflatex → PDF + PNG-превью первой страницы.
 
-    Пишет полный PDF в out_pdf и превью 1-й страницы в out_png. True если успешно.
+    Пишет полный PDF в out_pdf и превью 1-й страницы в out_png.
+    Возвращает (ok, error): error — хвост лога pdflatex при провале (для авто-фикса).
     """
     with tempfile.TemporaryDirectory(prefix="latex_") as tmpdir:
         tmp = Path(tmpdir)
@@ -100,23 +236,39 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
         tex_path.write_text(full_doc, encoding="utf-8")
 
         # 1) pdflatex. -no-shell-escape — контент идёт от LLM, отключаем \write18.
+        # НЕТ -halt-on-error: nonstopmode восстанавливается после нефатальных
+        # ошибок и всё равно отдаёт PDF — это лучше «уродливого» plain-фолбэка.
         try:
             res = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                ["pdflatex", "-interaction=nonstopmode",
                  "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
                 # errors="replace": лог pdflatex может содержать не-UTF-8 байты
                 # (cp1251/T2A в предупреждениях) — строгий декод иначе роняет рендер.
                 capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                env=_TEX_SAFE_ENV,  # openin_any=p — запрет чтения произвольных файлов
             )
         except subprocess.TimeoutExpired:
             logger.error("pdflatex timeout")
-            return False
+            return False, "pdflatex timeout"
 
         pdf_path = tmp / "doc.pdf"
+        log = res.stdout or ""
+        # Каждая ошибка TeX начинается со строки "! ..." — считаем их.
+        n_errors = log.count("\n! ")
         if not pdf_path.exists():
-            tail = (res.stdout or "")[-800:]
-            logger.error(f"pdflatex failed:\n{tail}")
-            return False
+            tail = log[-1200:]
+            logger.error(f"pdflatex produced no PDF:\n{tail}")
+            return False, tail
+        # PDF есть, но если ошибок много — документ покорёжен, лучше в fix-chain.
+        if n_errors >= _MAX_RECOVERABLE_TEX_ERRORS:
+            tail = log[-1200:]
+            logger.warning(
+                f"pdflatex recovered with {n_errors} errors "
+                f"(≥{_MAX_RECOVERABLE_TEX_ERRORS}) — отдаём в fix-chain"
+            )
+            return False, tail
+        if n_errors:
+            logger.warning(f"pdflatex отдал PDF с {n_errors} восстановленной(ыми) ошибкой(ами)")
 
         out_pdf.parent.mkdir(parents=True, exist_ok=True)
         out_pdf.write_bytes(pdf_path.read_bytes())
@@ -131,19 +283,19 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> bool:
             )
         except subprocess.CalledProcessError as e:
             logger.error(f"pdftoppm failed: {e.stderr.decode() if e.stderr else ''}")
-            return False
+            return False, "pdftoppm failed"
         except subprocess.TimeoutExpired:
             logger.error("pdftoppm timeout")
-            return False
+            return False, "pdftoppm timeout"
 
         png_src = tmp / "out.png"
         if not png_src.exists():
             logger.error(f"PNG not produced. Files: {list(tmp.iterdir())}")
-            return False
+            return False, "PNG not produced"
 
         # 3) Обрезаем белое поле превью через PIL.
         out_png.write_bytes(_trim_white(png_src.read_bytes()))
-        return True
+        return True, ""
 
 
 def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
@@ -173,12 +325,12 @@ def _trim_white(png_bytes: bytes, padding: int = 20) -> bytes:
 async def render_solution(latex_content: str) -> dict:
     """Асинхронный фасад. Кэш по hash контента.
 
-    Возвращает {"pdf": bytes|None, "preview_png": bytes|None}:
+    Возвращает {"pdf": bytes|None, "preview_png": bytes|None, "error": str|None}:
       • pdf         — полное решение (векторное, многостраничное);
-      • preview_png — PNG-превью первой страницы (для инлайн-показа в чате).
-    Оба None, если рендер не удался.
+      • preview_png — PNG-превью первой страницы (для инлайн-показа в чате);
+      • error       — хвост лога pdflatex при провале (для авто-фикса LaTeX), иначе None.
     """
-    empty = {"pdf": None, "preview_png": None}
+    empty = {"pdf": None, "preview_png": None, "error": None}
     if not latex_content or len(latex_content.strip()) < 10:
         logger.warning("LaTeX content empty")
         return empty
@@ -188,16 +340,155 @@ async def render_solution(latex_content: str) -> dict:
     png_path = CACHE_DIR / f"{h}.png"
     if pdf_path.exists() and png_path.exists():
         logger.info(f"render cache HIT: {h}")
-        return {"pdf": pdf_path.read_bytes(), "preview_png": png_path.read_bytes()}
+        return {"pdf": pdf_path.read_bytes(), "preview_png": png_path.read_bytes(), "error": None}
 
     logger.info(f"render START: {h}, {len(latex_content)} chars")
-    ok = await asyncio.to_thread(_compile_sync, latex_content, pdf_path, png_path)
+    ok, err = await asyncio.to_thread(_compile_sync, latex_content, pdf_path, png_path)
     if not ok:
-        return empty
+        return {"pdf": None, "preview_png": None, "error": err}
 
     pdf_bytes = pdf_path.read_bytes()
     png_bytes = png_path.read_bytes()
     logger.info(
         f"render DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB, png={len(png_bytes)/1024:.0f}KB"
     )
-    return {"pdf": pdf_bytes, "preview_png": png_bytes}
+    return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Бронебойный fallback: `Verbatim`-обёртка.
+#
+# Когда основной рендер не вытянул даже после Sonnet-фикса, заворачиваем сам
+# LaTeX-фрагмент в `\begin{Verbatim}…\end{Verbatim}` (пакет fancyvrb, идёт с
+# texlive-latex-recommended). Этот шаблон компилируется ВСЕГДА — verbatim
+# не интерпретирует команды, а fancyvrb разрывает длинные строки. На выходе —
+# PDF с читаемым «черновиком решения», а не .tex-файл, который юзеру нечего
+# делать. Лучше «черновой PDF» чем «иди в Overleaf».
+# ════════════════════════════════════════════════════════════════════════
+
+# ВАЖНО: breaklines/breakanywhere — это фичи fvextra, НЕ базового fancyvrb.
+# Подключаем fvextra (он в texlive-latex-extra → есть в нашем Docker-образе).
+# Опции — минимальный безопасный набор; никаких commandchars (риск конфликта с
+# контентом, который содержит {} или \).
+_VERBATIM_TEMPLATE = r"""\documentclass[10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage[paperwidth=18cm,paperheight=22cm,margin=0.7cm,top=0.9cm,bottom=0.9cm]{geometry}
+\usepackage{xcolor}
+\usepackage{fvextra}
+\pagenumbering{gobble}
+\definecolor{accent}{HTML}{1d4ed8}
+\begin{document}
+\noindent{\color{accent}\textbf{\large Решение (черновой вид)}}\\[0.3em]
+\small Форматирование не вытянулось — содержимое ниже как есть. Если что-то непонятно — напиши @manag31.\\[0.6em]
+\begin{Verbatim}[breaklines=true,fontsize=\small]
+%CONTENT%
+\end{Verbatim}
+\end{document}
+"""
+
+# Ещё более примитивный шаблон на случай если даже fvextra по какой-то причине
+# не отработает: чистый built-in verbatim (есть в любом LaTeX) — длинные строки
+# выйдут за поле, но PDF будет.
+_VERBATIM_PLAIN_TEMPLATE = r"""\documentclass[10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage[paperwidth=22cm,paperheight=30cm,margin=0.7cm]{geometry}
+\pagenumbering{gobble}
+\begin{document}
+\textbf{\large Решение (черновой вид)}\\
+\small Форматирование не вытянулось — содержимое ниже как есть. Напиши @manag31 если что.\\[0.6em]
+\begin{verbatim}
+%CONTENT%
+\end{verbatim}
+\end{document}
+"""
+
+
+def _try_compile_template(template: str, latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
+    """Пробует скомпилировать данный шаблон с подставленным контентом.
+
+    Возвращает (ok, err_tail).
+    """
+    safe = (
+        latex_content
+        .replace(r"\end{Verbatim}", r"\end {Verbatim}")
+        .replace(r"\end{verbatim}", r"\end {verbatim}")
+    )
+    with tempfile.TemporaryDirectory(prefix="latex_vb_") as tmpdir:
+        tmp = Path(tmpdir)
+        tex_path = tmp / "doc.tex"
+        full_doc = template.replace("%CONTENT%", safe)
+        tex_path.write_text(full_doc, encoding="utf-8")
+        try:
+            res = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                 "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                env=_TEX_SAFE_ENV,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "pdflatex timeout"
+        pdf_path = tmp / "doc.pdf"
+        if not pdf_path.exists():
+            return False, (res.stdout or "")[-1500:]
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(pdf_path.read_bytes())
+        ppm_prefix = tmp / "out"
+        try:
+            subprocess.run(
+                ["pdftoppm", "-r", str(PREVIEW_DPI), "-png", "-singlefile",
+                 str(pdf_path), str(ppm_prefix)],
+                capture_output=True, check=True, timeout=20,
+            )
+            png_src = tmp / "out.png"
+            if png_src.exists():
+                out_png.write_bytes(_trim_white(png_src.read_bytes()))
+        except Exception as e:
+            logger.warning(f"verbatim pdftoppm failed (non-critical): {e}")
+        return True, ""
+
+
+def _compile_verbatim_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[bool, str]:
+    """Гарантированный рендер через verbatim — сначала fvextra (красиво),
+    затем чистый built-in verbatim. Если и это упадёт, значит pdflatex
+    в принципе не работает.
+    """
+    ok, err = _try_compile_template(_VERBATIM_TEMPLATE, latex_content, out_pdf, out_png)
+    if ok:
+        return True, ""
+    logger.warning(f"verbatim (fvextra) failed: {err[-300:]} — пробую plain verbatim")
+    ok, err = _try_compile_template(_VERBATIM_PLAIN_TEMPLATE, latex_content, out_pdf, out_png)
+    if ok:
+        return True, ""
+    logger.error(f"plain verbatim ТОЖЕ failed (TeX engine down?): {err[-300:]}")
+    return False, err
+
+
+async def render_verbatim(latex_content: str) -> dict:
+    """Бронебойный fallback. Возвращает {pdf, preview_png, error}."""
+    empty = {"pdf": None, "preview_png": None, "error": None}
+    if not latex_content or len(latex_content.strip()) < 5:
+        return empty
+
+    h = "vb_" + _content_hash(latex_content)
+    pdf_path = CACHE_DIR / f"{h}.pdf"
+    png_path = CACHE_DIR / f"{h}.png"
+    if pdf_path.exists():
+        png = png_path.read_bytes() if png_path.exists() else None
+        return {"pdf": pdf_path.read_bytes(), "preview_png": png, "error": None}
+
+    logger.info(f"render_verbatim START: {h}, {len(latex_content)} chars")
+    ok, err = await asyncio.to_thread(_compile_verbatim_sync, latex_content, pdf_path, png_path)
+    if not ok:
+        return {"pdf": None, "preview_png": None, "error": err}
+
+    pdf_bytes = pdf_path.read_bytes()
+    png_bytes = png_path.read_bytes() if png_path.exists() else None
+    logger.info(
+        f"render_verbatim DONE: {h}, pdf={len(pdf_bytes)/1024:.0f}KB"
+        + (f", png={len(png_bytes)/1024:.0f}KB" if png_bytes else " (no png)")
+    )
+    return {"pdf": pdf_bytes, "preview_png": png_bytes, "error": None}

@@ -1,0 +1,41 @@
+"""Герметичная среда для unit-тестов: dummy-env + заглушка render.
+
+Реальная БД/сеть не используются — всё мокается в тестах. Здесь только готовим
+импортируемость app.* без .env и без mkdir('/app/render_cache') в latex_to_png.
+"""
+import os
+import pathlib
+import sys
+import tempfile
+import types
+
+# Dummy-env (env-vars приоритетнее .env у pydantic-settings) — Settings() сконструируется.
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
+os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret-0123456789")
+os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("OPENAI_API_KEY", "test-key")
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://t:t@localhost:5432/test")
+
+# Заглушка render: app.ai.pipeline импортит app.render.latex_to_png на верхнем уровне,
+# а тот при импорте делает mkdir('/app/render_cache'). В тестах render не нужен.
+_stub = types.ModuleType("app.render.latex_to_png")
+
+
+async def _noop_render(*_a, **_k):
+    return {"preview_png": None, "pdf": None}
+
+
+_stub.render_solution = _noop_render
+_stub.render_verbatim = _noop_render  # бронебойный fallback в pipeline
+# app.render.figures импортит эти имена из latex_to_png — отдаём безопасные заглушки
+# (tmp-кэш, identity-trim), чтобы РЕАЛЬНЫЙ figures.py импортировался и тестировался.
+_stub.CACHE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="render_cache_test_"))
+_stub.PREVIEW_DPI = 300
+_stub._trim_white = lambda b, *a, **k: b
+_stub._TEX_SAFE_ENV = {}  # figures.py импортит для env субпроцесса (в тестах не исполняется)
+sys.modules.setdefault("app.render.latex_to_png", _stub)
+
+# Заглушка plain_pdf (free-mode рендер через ReportLab) — в тестах не нужна реально.
+_plain_stub = types.ModuleType("app.render.plain_pdf")
+_plain_stub.render_plain_pdf = _noop_render
+sys.modules.setdefault("app.render.plain_pdf", _plain_stub)

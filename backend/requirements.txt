@@ -34,3 +34,6 @@ pdf2image==1.17.0              # для парсинга учебников (PDF
 # Utils
 python-multipart==0.0.12
 tenacity==9.0.0
+
+# Plain-PDF рендер (free-mode): пишем PDF напрямую без pdflatex.
+reportlab==4.2.5

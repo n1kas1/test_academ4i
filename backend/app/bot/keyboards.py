@@ -6,51 +6,29 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from app.config import settings
+from app.config import settings, CREDIT_PACKAGES
 
 # === Тексты кнопок главного меню ===
-BTN_BUY_PACK = "🎁 Пакеты задач"
-BTN_BUY_PREMIUM = "💎 Premium"
+BTN_BUY_CREDITS = "💳 Пакеты кредитов"
 BTN_BALANCE = "📊 Мой баланс"
 BTN_HELP = "ℹ️ Помощь"
 
 
-def pack_choice_keyboard() -> InlineKeyboardMarkup:
-    """Inline-выбор пакета задач (без срока)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🎁 {settings.pack_tasks} задач — {settings.pack_price_stars}⭐",
-            callback_data="buy:pack5",
-        )],
-        [InlineKeyboardButton(
-            text=f"🎁 {settings.pack_large_tasks} задач — {settings.pack_large_price_stars}⭐",
-            callback_data="buy:pack10",
-        )],
-    ])
-
-
-def premium_choice_keyboard() -> InlineKeyboardMarkup:
-    """Inline-выбор периода Premium."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"💎 Неделя — {settings.premium_week_price_stars}⭐",
-            callback_data="buy:premweek",
-        )],
-        [InlineKeyboardButton(
-            text=f"💎 Месяц — {settings.premium_price_stars}⭐",
-            callback_data="buy:premmonth",
-        )],
-    ])
-
-
 def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> ReplyKeyboardMarkup:
-    """Главное меню. Если у юзера активен Premium / он админ — кнопки покупки скрыты."""
-    if is_premium or is_admin:
+    """Главное меню (credit-модель). Админ → без кнопки покупки.
+
+    Параметр is_premium сохранён для совместимости вызовов, в credit-модели не влияет.
+    """
+    # Free-mode и админ — без кнопки покупки.
+    if is_admin or settings.free_mode:
         keyboard = [[KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HELP)]]
-        placeholder = "📸 Кинь фото задачи (безлимит активен)"
+        if is_admin:
+            placeholder = "📸 Кинь фото задачи (админ — безлимит)"
+        else:
+            placeholder = "📸 Кинь фото или ✍️ напиши условие"
     else:
         keyboard = [
-            [KeyboardButton(text=BTN_BUY_PACK), KeyboardButton(text=BTN_BUY_PREMIUM)],
+            [KeyboardButton(text=BTN_BUY_CREDITS)],
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_HELP)],
         ]
         placeholder = "📸 Кинь фото задачи или выбери из меню"
@@ -63,30 +41,38 @@ def main_menu_keyboard(is_premium: bool = False, is_admin: bool = False) -> Repl
     )
 
 
-def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup:
-    """Inline под решением: показать LaTeX + (опц.) перерешать.
+def packages_keyboard() -> InlineKeyboardMarkup:
+    """Inline-выбор пакета кредитов (callback buy:<key>)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{p.title} — {p.credits} кредитов · {p.stars}⭐",
+            callback_data=f"buy:{p.key}",
+        )]
+        for p in CREDIT_PACKAGES
+    ])
 
-    Оба действия на одном token (данные решения лежат в Redis под sol:{token}).
-    allow_resolve=False — для результата самого «перерешать» (одна бесплатная
-    попытка на решение, чтобы не было бесконечной цепочки).
+
+def mode_choice_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Inline-выбор режима перед решением (callback mode:<token>:<standard|premium>)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"⚡ Стандарт · {settings.standard_cost} кредит",
+            callback_data=f"mode:{token}:standard",
+        )],
+        [InlineKeyboardButton(
+            text=f"💎 Премиум · {settings.premium_cost} кредитов",
+            callback_data=f"mode:{token}:premium",
+        )],
+    ])
+
+
+def solution_keyboard(token: str, allow_resolve: bool = True) -> InlineKeyboardMarkup | None:
+    """Под решением никаких кнопок: ни LaTeX, ни «Перерешать».
+
+    Сигнатура и сам файл оставлены для обратной совместимости импортов; функция
+    всегда возвращает None.
     """
-    rows = [[InlineKeyboardButton(
-        text="📋 Показать LaTeX (для копирования)",
-        callback_data=f"latex:{token}",
-    )]]
-    if allow_resolve:
-        rows.append([InlineKeyboardButton(
-            text="🔄 Перерешать",
-            callback_data=f"resolve:{token}",
-        )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def renew_premium_keyboard() -> InlineKeyboardMarkup:
-    """Inline-кнопка под уведомлением об окончании Premium."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💎 Продлить Premium", callback_data="renew_premium"),
-    ]])
+    return None
 
 
 def task_choice_keyboard(token: str, task_ids: list[str]) -> InlineKeyboardMarkup:

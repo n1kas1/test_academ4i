@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-lang-cyrillic \
     texlive-science \
     texlive-extra-utils \
+    # DejaVu TTF — для ReportLab plain-PDF (Cyrillic + Unicode math).
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,6 +26,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Потом весь код
 COPY . .
+
+# Непривилегированный пользователь (M3): процесс НЕ от root — снижает blast-radius
+# при возможной RCE. render_cache должен быть писабельным для appuser (его создаёт
+# код при импорте; figures-подкаталог — в рантайме). /tmp писабелен всем (pdflatex).
+RUN useradd -m -u 10001 appuser \
+    && mkdir -p /app/render_cache \
+    && chown -R appuser:appuser /app/render_cache
+USER appuser
 
 # Health-check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \

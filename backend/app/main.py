@@ -7,8 +7,10 @@ Webhook от Telegram приходит на POST /webhook,
 секрет проверяется через X-Telegram-Bot-Api-Secret-Token.
 """
 import asyncio
+import hmac
 import logging
 import socket
+import sys
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher
@@ -20,10 +22,26 @@ from loguru import logger
 
 from app.config import settings
 from app.bot import admin, handlers
+from app.bot.log_middleware import UserContextMiddleware
 from app.payments import tg_stars
 from app.core.db import close_db, init_db
-from app.core.redis import close_redis, init_redis
-from app.premium_notify import premium_notifier_loop
+from app.core.redis import close_redis, get_redis, init_redis
+
+
+# ── Loguru: формат с user-контекстом (выставляется UserContextMiddleware) ────
+# `extra` имеет дефолты "—" чтобы не падать на логах вне TG-handler'а
+# (lifespan, FastAPI, фоновые задачи без юзера).
+logger.remove()
+logger.add(
+    sys.stderr,
+    level=settings.log_level,
+    format=(
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <7} | "
+        "tg={extra[tg]} @{extra[user]} | "
+        "{name}:{function}:{line} - {message}"
+    ),
+)
+logger.configure(extra={"tg": "—", "user": "—"})
 
 # === Aiogram setup ===
 bot = Bot(
@@ -31,6 +49,11 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+# outer-middleware: вешает logger.contextualize(tg=..., user=...) на КАЖДЫЙ
+# апдейт ДО любого роутера. Дальше все логи (pipeline, claude, deepseek, render)
+# автоматически содержат tg=ID @username — грепаешь логи по юзеру одним фильтром.
+dp.update.outer_middleware(UserContextMiddleware())
+
 # payments router идёт ПЕРВЫМ — чтобы pre_checkout_query и successful_payment
 # ловились ДО обработчика photo/text сообщений
 dp.include_router(tg_stars.router)
@@ -70,17 +93,21 @@ async def lifespan(app: FastAPI):
             f"App continues; reinstall webhook later if needed."
         )
 
-    # Фоновые уведомления о Premium (скоро закончится / закончился).
-    notifier_task = asyncio.create_task(premium_notifier_loop(bot))
-
     yield
 
     logger.info("Shutting down...")
-    notifier_task.cancel()
-    try:
-        await notifier_task
-    except asyncio.CancelledError:
-        pass
+    # Ждём in-flight обработки апдейтов — чтобы не терять решения после
+    # списания кредитов / показа MSG_PROCESSING юзеру. 30с потолок.
+    if _BG_TASKS:
+        n = len(_BG_TASKS)
+        logger.info(f"waiting up to 30s for {n} in-flight updates...")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*list(_BG_TASKS), return_exceptions=True),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"shutdown: {len(_BG_TASKS)} updates still running, dropping")
     await bot.delete_webhook()
     await bot.session.close()
     await close_db()
@@ -95,16 +122,58 @@ async def health():
     return {"status": "ok"}
 
 
+# Сильные ссылки на background-таски: event loop держит только weak-ref,
+# поэтому без этого set'а GC может прибить task посреди работы (баг Python:
+# https://docs.python.org/3/library/asyncio-task.html#creating-tasks).
+_BG_TASKS: set[asyncio.Task] = set()
+
+# TTL дедупа update_id: Telegram может ретраить webhook часами при ошибках.
+# 24 часа — с запасом, ключи в Redis копеечные.
+WEBHOOK_DEDUP_TTL_SEC = 24 * 3600
+
+
+async def _process_update_bg(update: Update) -> None:
+    """Фоновая обработка update'а. Логируем исключения, чтобы не терялись."""
+    try:
+        await dp.feed_update(bot, update)
+    except Exception:
+        logger.exception(f"update {update.update_id} processing failed")
+
+
 @app.post("/webhook")
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str = Header(None),
 ):
-    """Принимаем апдейты от Telegram."""
-    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+    """Принимаем апдейты от Telegram.
+
+    Возвращаем 200 OK МГНОВЕННО, обработку запускаем в фоне:
+    - Telegram-таймаут вебхука ~30с; долгий solve вызывает ретраи и дубли решений.
+    - Через update_id делаем дедуп: даже если ретрай прилетит — пропускаем.
+    """
+    # Constant-time сравнение (без timing side-channel). None → отказ.
+    if not x_telegram_bot_api_secret_token or not hmac.compare_digest(
+        x_telegram_bot_api_secret_token, settings.telegram_webhook_secret
+    ):
         raise HTTPException(403, "Invalid secret")
 
     data = await request.json()
+    # Дедуп ставим как можно раньше, ещё до model_validate, чтобы любой
+    # повтор (даже c битым payload) не приводил к двойной обработке.
+    update_id = data.get("update_id") if isinstance(data, dict) else None
+    if update_id is not None:
+        redis = get_redis()
+        seen = not await redis.set(
+            f"upd:{update_id}", "1", nx=True, ex=WEBHOOK_DEDUP_TTL_SEC,
+        )
+        if seen:
+            logger.warning(f"duplicate update {update_id} skipped")
+            return {"ok": True}
+
     update = Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, update)
+
+    # Fire-and-forget: запускаем в фоне и держим strong-ref до завершения.
+    task = asyncio.create_task(_process_update_bg(update))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
     return {"ok": True}

@@ -23,9 +23,6 @@ textbooks/*.djvu
 *.log
 logs/
 
-# Docker
-.dockerignore
-
 # IDE
 .idea/
 .vscode/
