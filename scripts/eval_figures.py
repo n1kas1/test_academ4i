@@ -6,6 +6,10 @@ FORCED-figure путь на НАСТОЯЩЕМ Gemini + pdflatex. Меряет r
     docker compose run --rm backend python scripts/eval_figures.py
 """
 import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # /app для app.*
 
 from scripts.figure_pool import POOL
 from app.ai.pipeline import _task_needs_figure, _solver_figure

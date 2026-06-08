@@ -6,6 +6,10 @@
     docker compose run --rm backend python scripts/eval_solve.py
 """
 import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # /app для app.*
 
 from app.ai.haiku_gate import is_math_or_physics
 from app.ai.gemini import solve_with_gemini
