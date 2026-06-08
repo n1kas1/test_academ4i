@@ -20,15 +20,19 @@ from loguru import logger
 CACHE_DIR = Path("/app/render_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Параноидальный режим TeX для компиляции НЕДОВЕРЕННОГО (LLM) LaTeX: чтение/запись
-# файлов разрешены ТОЛЬКО в текущем каталоге (openin_any=p / openout_any=p) — это
-# блокирует LFI вида \input{/app/.env}/\openin произвольного пути и эксфильтрацию
-# через PDF. PATH и прочее наследуем от родителя. Используется во ВСЕХ pdflatex.
-_TEX_SAFE_ENV = {**os.environ, "openin_any": "p", "openout_any": "p"}
+# Безопасный режим TeX для компиляции НЕДОВЕРЕННОГО (LLM) LaTeX.
+# openin_any=r (restricted): блокирует dotfiles (.env) и `..`-traversal, НО разрешает
+# абсолютные пути к не-скрытым файлам — это НУЖНО для \includegraphics наших PNG из
+# /app/render_cache/figures (с openin_any=p они не читались → график печатался как
+# ТЕКСТ-путь). Основная LFI-защита всё равно на санитайзере: strip_dangerous_tex
+# вырезает \input/\openin/\read/\write (которые печатают содержимое файла), а
+# \includegraphics только встраивает картинку (текст файла не утекает).
+# openout_any=p — запись не нужна, оставляем параноидальной.
+_TEX_SAFE_ENV = {**os.environ, "openin_any": "r", "openout_any": "p"}
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
-TEMPLATE_VERSION = "v9"
+TEMPLATE_VERSION = "v10"
 
 # Страница A5-формата (14×22см): узкая → крупный шрифт на телефоне, а нормальная
 # высота → LaTeX сам разбивает длинное решение на несколько страниц (раньше была
