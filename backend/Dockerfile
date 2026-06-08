@@ -27,6 +27,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Потом весь код
 COPY . .
 
+# Непривилегированный пользователь (M3): процесс НЕ от root — снижает blast-radius
+# при возможной RCE. render_cache должен быть писабельным для appuser (его создаёт
+# код при импорте; figures-подкаталог — в рантайме). /tmp писабелен всем (pdflatex).
+RUN useradd -m -u 10001 appuser \
+    && mkdir -p /app/render_cache \
+    && chown -R appuser:appuser /app/render_cache
+USER appuser
+
 # Health-check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
