@@ -1,4 +1,4 @@
-"""Eval-харнесс качества рисунков: прогон пула (tests/figure_pool.py) через
+"""Eval-харнесс качества рисунков: прогон пула (scripts/figure_pool.py) через
 FORCED-figure путь на НАСТОЯЩЕМ Gemini + pdflatex. Меряет recall авто-триггера
 `_task_needs_figure` и долю компилируемых рисунков по темам.
 
@@ -7,7 +7,7 @@ FORCED-figure путь на НАСТОЯЩЕМ Gemini + pdflatex. Меряет r
 """
 import asyncio
 
-from tests.figure_pool import POOL
+from scripts.figure_pool import POOL
 from app.ai.pipeline import _task_needs_figure, _solver_figure
 from app.render.figures import compile_figure, FIG_RE
 
