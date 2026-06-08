@@ -321,7 +321,17 @@ async def _render_with_autofix(
         logger.error(f"verbatim render failed: {e}")
     return rendered, latex
 
-CACHE_HIT_THRESHOLD = 0.87       # понижено с 0.93 — больше попаданий в кэш generated
+CACHE_HIT_THRESHOLD = 0.93       # короткие параметрические запросы (y=x^3 vs y=x^4)
+                                 # почти идентичны по эмбеддингу → 0.87 отдавал ЧУЖОЙ
+                                 # ответ. 0.93 + _cache_unsafe() ниже.
+
+
+def _cache_unsafe(condition_text: str, user_hint: str = "") -> bool:
+    """НЕ доверять семантическому кэшу: (1) короткий запрос — 1 токен меняет ответ
+    (y=x^3 vs y=x^4, 2+2 vs 2+3), а эмбеддинги почти совпадают → ложный cache-hit;
+    (2) запрос с рисунком — специфика функции критична, регенерация дёшева.
+    Решаем заново (комфорт/корректность важнее экономии)."""
+    return len((condition_text or "").strip()) < 60 or _user_wants_figure(condition_text, user_hint)
 RAG_MIN_SIMILARITY = 0.65
 RAG_TOP_K = 5
 RAG_USE_TOP = 3
@@ -509,7 +519,7 @@ async def solve_task_from_photo(
     #    skip_cache=True (например «перерешать») → не берём из кэша, решаем заново.
     # Кэш готовых решений — только для standard. Premium всегда решает заново
     # (гарантия Sonnet+thinking за 10 кредитов).
-    use_cache = (not skip_cache) and (mode == "standard")
+    use_cache = (not skip_cache) and (mode == "standard") and not _cache_unsafe(condition_text, user_hint)
     cache_candidates = await find_similar_solutions(
         embedding,
         topic=topic,
@@ -626,7 +636,7 @@ async def solve_task_from_text(
         min_similarity=RAG_MIN_SIMILARITY, only_generated=False,
     )
 
-    use_cache = not skip_cache
+    use_cache = (not skip_cache) and not _cache_unsafe(condition_text, user_hint)
     cache_candidates = await find_similar_solutions(
         embedding, topic=topic, top_k=1,
         min_similarity=CACHE_HIT_THRESHOLD, only_generated=True,

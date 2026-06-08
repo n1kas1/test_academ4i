@@ -142,7 +142,9 @@ def test_handler_caption_free_mode(monkeypatch):
 
 # ─────────────────────── pipeline: роутинг режима ───────────────────────
 
-def _patch_pipeline(monkeypatch, condition="Найдите производную $y=\\ln x$.", task_ids=None):
+def _patch_pipeline(monkeypatch,
+                    condition="Найдите производную функции $y=\\ln x$ и определите промежутки её возрастания и убывания на области определения.",
+                    task_ids=None):
     """Мокаем все внешние зависимости pipeline, возвращаем (solver, cv, find).
 
     `solver` мокает router _solver_solve — он маршрутит на gemini/deepseek в
