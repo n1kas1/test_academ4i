@@ -33,6 +33,30 @@ async def _gen_and_compile(condition: str, topic: str) -> bool:
     return False
 
 
+async def _embedding_ok() -> bool:
+    """E2E: рисунок РЕАЛЬНО встроен в итоговый PDF (а не напечатан как текст-путь).
+    Ловит регрессию openin_any=p, из-за которой \\includegraphics печатал путь."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from app.ai.pipeline import _render_with_autofix
+    sol = (r"\hd{График}" "\n%%FIG\n"
+           r"\begin{tikzpicture}\begin{axis}[axis lines=center,width=6cm]"
+           r"\addplot[blue,domain=-3:3,samples=30]{x^2};\end{axis}\end{tikzpicture}"
+           "\n%%ENDFIG\n\\ans{парабола}")
+    rendered, _ = await _render_with_autofix(sol, condition_text="нарисуй график y=x^2", telegram_id=0)
+    pdf = rendered.get("pdf")
+    if not pdf:
+        print("EMBED: НЕТ PDF"); return False
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "o.pdf"; p.write_bytes(pdf)
+        txt = subprocess.run(["pdftotext", str(p), "-"], capture_output=True,
+                             encoding="utf-8", errors="replace").stdout
+    leaked = "render_cache/figures" in txt
+    print(f"EMBED: {'РИСУНОК ВСТРОЕН ✓' if not leaked else 'СЛОМАНО — путь как текст ✗'}")
+    return not leaked
+
+
 async def main() -> None:
     rows = []
     for i, p in enumerate(POOL, 1):
@@ -65,6 +89,9 @@ async def main() -> None:
           f"| собрался рисунок {sum(1 for r in triggered if r[3])}")
     nonfig_all = [r for r in rows if not r[1]]
     print(f"non-figure задач: {len(nonfig_all)} | ложных триггеров {sum(1 for r in nonfig_all if r[2])}")
+
+    print("\n================ E2E EMBED ================")
+    await _embedding_ok()
 
 
 if __name__ == "__main__":
