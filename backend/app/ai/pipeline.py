@@ -167,6 +167,21 @@ def _is_plain_format(text: str) -> bool:
     return any(m in text for m in _PLAIN_MARKERS)
 
 
+async def _compiled_figure_paths(latex_with_fig: str) -> list:
+    """PNG-пути из %%FIG-блоков для встраивания в plain-фолбэк (чтобы рисунок не
+    терялся при деградации LaTeX→plain). compile_figure кэширует по hash → если
+    рисунок уже собирался в основном пути, это cache-hit (мгновенно)."""
+    paths: list = []
+    for m in FIG_RE.finditer(latex_with_fig or ""):
+        try:
+            p = await compile_figure(m.group(1))
+            if p:
+                paths.append(p)
+        except Exception as e:
+            logger.warning(f"plain figure recompile failed: {e}")
+    return paths
+
+
 _FREE_FIX_ATTEMPTS = 2  # сколько раз пытаемся починить LaTeX моделью до plain-фолбэка
 
 
@@ -202,6 +217,7 @@ async def _render_with_autofix(
 
     # Рисунки: %%FIG-блоки компилируем изолированно → \includegraphics. Ошибка
     # отдельного рисунка не должна ронять всё решение (он молча опускается).
+    _latex_with_fig = latex  # с %%FIG — пригодится для plain-фолбэка (не теряем рисунок)
     try:
         latex, fig_ok, fig_failed = await render_figures_in_latex(latex)
         if fig_ok or fig_failed:
@@ -256,10 +272,11 @@ async def _render_with_autofix(
             try:
                 plain = await _solver_plain(condition_text)
                 if plain:
-                    rendered_plain = await render_plain_pdf(plain)
+                    fig_paths = await _compiled_figure_paths(_latex_with_fig)
+                    rendered_plain = await render_plain_pdf(plain, figure_paths=fig_paths)
                     if rendered_plain.get("pdf"):
-                        logger.info("plain-PDF собран ✓")
-                        log_event(telegram_id, "render_plain_fallback")
+                        logger.info(f"plain-PDF собран ✓ (рисунков встроено: {len(fig_paths)})")
+                        log_event(telegram_id, "render_plain_fallback", figures=len(fig_paths))
                         return rendered_plain, plain
             except Exception as e:
                 logger.warning(f"plain-pipeline failed: {e}")

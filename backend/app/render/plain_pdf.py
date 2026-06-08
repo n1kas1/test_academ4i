@@ -23,7 +23,8 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Image as RLImage, Paragraph, SimpleDocTemplate, Spacer
 
 
 # Кастомная страница 16×22см (мобильно-удобный размер, как LaTeX-шаблон).
@@ -93,7 +94,20 @@ def _to_paragraph_html(block: str) -> str:
     return esc.replace("\n", "<br/>")
 
 
-def _compile_sync(text: str) -> bytes:
+def _append_figures(flow: list, figure_paths, content_w: float) -> None:
+    """Встраивает скомпилированные PNG-рисунки в plain-PDF (чтобы рисунок не
+    терялся, когда LaTeX-путь деградировал в plain-фолбэк). Масштаб по ширине."""
+    for fp in figure_paths or ():
+        try:
+            iw, ih = ImageReader(str(fp)).getSize()
+            scale = min(1.0, content_w / iw) if iw else 1.0
+            flow.append(Spacer(1, 10))
+            flow.append(RLImage(str(fp), width=iw * scale, height=ih * scale))
+        except Exception as e:
+            logger.warning(f"plain_pdf: не удалось вставить рисунок {fp}: {e}")
+
+
+def _compile_sync(text: str, figure_paths=None) -> bytes:
     body_font = _register_fonts()
     text = _wrap_long_lines(text)
 
@@ -123,20 +137,23 @@ def _compile_sync(text: str) -> bytes:
         flow.append(Paragraph(_to_paragraph_html(block), body_style))
         if i < len(blocks) - 1:
             flow.append(Spacer(1, 6))
+    _append_figures(flow, figure_paths, _PAGE_W - 1.8 * cm)
     doc.build(flow)
     return buf.getvalue()
 
 
-async def render_plain_pdf(text: str) -> dict:
+async def render_plain_pdf(text: str, figure_paths=None) -> dict:
     """Plain-text → PDF. Возвращает {pdf, preview_png=None, error}.
 
+    figure_paths — пути к УЖЕ скомпилированным PNG-рисункам: встраиваются в конец,
+    чтобы рисунок не пропадал, когда LaTeX-путь деградировал в plain-фолбэк.
     PNG-превью не делаем: Telegram сам показывает thumbnail PDF.
     """
     empty = {"pdf": None, "preview_png": None, "error": None}
     if not text or len(text.strip()) < 5:
         return {**empty, "error": "empty text"}
     try:
-        pdf_bytes = await asyncio.to_thread(_compile_sync, text)
+        pdf_bytes = await asyncio.to_thread(_compile_sync, text, figure_paths)
     except Exception as e:
         logger.exception(f"plain_pdf compile failed: {e}")
         return {**empty, "error": f"compile failed: {e}"}
