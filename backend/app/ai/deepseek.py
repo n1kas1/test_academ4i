@@ -54,12 +54,14 @@ def get_client() -> AsyncOpenAI:
     return _client
 
 
+# Любой вариант <task>/<TASK>/</task>/< / hint > и т.п. — регистронезависимо,
+# с учётом пробелов. Иначе юзер строчным </task> «закрывал» наш изоляционный тег.
+_ISO_TAG_RE = re.compile(r"<\s*(/?)\s*(task|hint)\s*>", re.IGNORECASE)
+
+
 def _strip_isolation_tags(s: str) -> str:
-    """Не даём юзеру «закрыть» наш изоляционный тег своим </TAG>."""
-    return (
-        s.replace("</TASK>", "</ TASK>").replace("<TASK>", "< TASK>")
-         .replace("</HINT>", "</ HINT>").replace("<HINT>", "< HINT>")
-    )
+    """Не даём юзеру «закрыть» наш изоляционный тег своим </TAG> (любой регистр/пробелы)."""
+    return _ISO_TAG_RE.sub(r"< \1\2>", s)
 
 
 def wrap_task(condition_text: str) -> str:

@@ -7,6 +7,7 @@ Webhook от Telegram приходит на POST /webhook,
 секрет проверяется через X-Telegram-Bot-Api-Secret-Token.
 """
 import asyncio
+import hmac
 import logging
 import socket
 import sys
@@ -150,7 +151,10 @@ async def telegram_webhook(
     - Telegram-таймаут вебхука ~30с; долгий solve вызывает ретраи и дубли решений.
     - Через update_id делаем дедуп: даже если ретрай прилетит — пропускаем.
     """
-    if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+    # Constant-time сравнение (без timing side-channel). None → отказ.
+    if not x_telegram_bot_api_secret_token or not hmac.compare_digest(
+        x_telegram_bot_api_secret_token, settings.telegram_webhook_secret
+    ):
         raise HTTPException(403, "Invalid secret")
 
     data = await request.json()

@@ -1,0 +1,29 @@
+# Секреты — НИКОГДА в образ (иначе попадают в слой через COPY . .)
+.env
+.env.*
+!.env.example
+
+# Локальное окружение / кэши — не нужны в образе и раздувают его
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Рантайм-кэш рендера (создаётся в контейнере)
+render_cache/
+
+# Тесты и dev-инструменты — в проде не исполняются
+tests/
+_verify_*.py
+_pool_harness.py
+_diag.py
+
+# VCS / прочее
+.git/
+.gitignore
+*.log
+.DS_Store

@@ -142,7 +142,7 @@ def _parse_ocr_json(raw: str) -> tuple[str, list[str]]:
     # 4) Совсем ничего — fail. Pipeline воспримет как OCR-fail и
     #    попросит юзера переснять, вместо того чтобы кормить markdown в solver.
     logger.error(
-        f"OCR JSON неразборчив, condition не извлечён. Raw head: {raw[:300]!r}"
+        f"OCR JSON неразборчив, condition не извлечён. Raw len={len(raw)}"
     )
     return "", []
 

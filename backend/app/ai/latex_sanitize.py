@@ -238,6 +238,24 @@ def wrap_cyrillic_in_math(text: str) -> str:
     return text
 
 
+# ─────────────────── Безопасность: опасные TeX-примитивы ──────────────
+
+# Команды чтения/записи файлов и загрузки пакетов. В легитимном решении/рисунке
+# их НЕТ; в выводе LLM они = вектор LFI (\input{/app/.env} → утечка через PDF) и
+# выполнения. Удаляем детерминированно. Основная защита — openin_any=p при
+# компиляции (см. render/*), это belt-and-suspenders на прямые случаи.
+# (?![a-zA-Z]) — не цепляем \includegraphics/\writefoo, но ловим \write18 (цифра).
+_DANGEROUS_TEX_RE = re.compile(
+    r"\\(input|include|includeonly|openin|openout|read|write|InputIfFileExists"
+    r"|special|immediate|catcode|usepackage|RequirePackage|shipout|input@path)(?![a-zA-Z])"
+)
+
+
+def strip_dangerous_tex(text: str) -> str:
+    """Удалить файловые/IO/package TeX-примитивы из недоверенного контента (LLM)."""
+    return _DANGEROUS_TEX_RE.sub("", text)
+
+
 # ─────────────────── Детектор проблем (для инструментации) ────────────
 
 # Литеральные Unicode-символы, которые под T2A фатальны без маппинга в шаблоне
@@ -295,6 +313,7 @@ def sanitize_for_render(latex: str) -> str:
     if not latex:
         return latex
     out = latex
+    out = strip_dangerous_tex(out)   # безопасность: убрать \input/\write/\usepackage и пр.
     out = strip_emoji(out)
     out = fix_block_in_inline(out)
     out = fix_ans_with_block(out)

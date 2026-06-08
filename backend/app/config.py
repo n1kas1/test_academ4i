@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str = "change-me"
     webhook_domain: str = "academ4i.duckdns.org"
 
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def _check_webhook_secret(cls, v: str) -> str:
+        """Fail-loud: не стартовать с предсказуемым/слабым секретом вебхука — иначе
+        любой, зная дефолт 'change-me', слал бы поддельные апдейты на /webhook.
+        Сгенерировать: python -c \"import secrets;print(secrets.token_urlsafe(32))\"."""
+        if v in ("", "change-me") or len(v) < 16:
+            raise ValueError(
+                "TELEGRAM_WEBHOOK_SECRET не задан/слабый (нужно >=16 символов, не 'change-me')"
+            )
+        return v
+
     # === Anthropic (Claude) — через ProxyAPI ===
     anthropic_api_key: str
     anthropic_base_url: str = "https://api.proxyapi.ru/anthropic"

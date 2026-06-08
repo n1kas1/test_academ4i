@@ -474,7 +474,7 @@ async def solve_task_from_photo(
 
     # 4) Классификация темы (для фильтрации retrieval)
     topic = classify_topic(condition_text)
-    logger.info(f"Topic: {topic} | condition: {condition_text[:120]}...")
+    logger.info(f"Topic: {topic} | condition_len={len(condition_text)}")
 
     # 5) Эмбеддинг и поиск похожих (для RAG-контекста)
     await _status(on_status, "🔎 Ищу похожие задачи…")
@@ -600,7 +600,7 @@ async def solve_task_from_text(
         return {"empty_input": True}
 
     topic = classify_topic(condition_text)
-    logger.info(f"Topic: {topic} | text: {condition_text[:120]}…")
+    logger.info(f"Topic: {topic} | text_len={len(condition_text)}")
 
     await _status(on_status, "🔎 Ищу похожие задачи…")
     embedding = await embed_text(condition_text)

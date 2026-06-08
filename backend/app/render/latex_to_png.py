@@ -9,6 +9,7 @@ Dockerfile-зависимости: texlive-latex-* + texlive-extra-utils (pdfcro
 import asyncio
 import hashlib
 import io
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -18,6 +19,12 @@ from loguru import logger
 
 CACHE_DIR = Path("/app/render_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Параноидальный режим TeX для компиляции НЕДОВЕРЕННОГО (LLM) LaTeX: чтение/запись
+# файлов разрешены ТОЛЬКО в текущем каталоге (openin_any=p / openout_any=p) — это
+# блокирует LFI вида \input{/app/.env}/\openin произвольного пути и эксфильтрацию
+# через PDF. PATH и прочее наследуем от родителя. Используется во ВСЕХ pdflatex.
+_TEX_SAFE_ENV = {**os.environ, "openin_any": "p", "openout_any": "p"}
 
 # Версия шаблона — инкрементим при любом изменении LATEX_TEMPLATE.
 # Это инвалидирует все старые кэши автоматически.
@@ -238,6 +245,7 @@ def _compile_sync(latex_content: str, out_pdf: Path, out_png: Path) -> tuple[boo
                 # errors="replace": лог pdflatex может содержать не-UTF-8 байты
                 # (cp1251/T2A в предупреждениях) — строгий декод иначе роняет рендер.
                 capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                env=_TEX_SAFE_ENV,  # openin_any=p — запрет чтения произвольных файлов
             )
         except subprocess.TimeoutExpired:
             logger.error("pdflatex timeout")
@@ -419,6 +427,7 @@ def _try_compile_template(template: str, latex_content: str, out_pdf: Path, out_
                 ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
                  "-no-shell-escape", "-output-directory", str(tmp), str(tex_path)],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+                env=_TEX_SAFE_ENV,
             )
         except subprocess.TimeoutExpired:
             return False, "pdflatex timeout"

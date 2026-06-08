@@ -11,6 +11,7 @@ import types
 
 # Dummy-env (env-vars приоритетнее .env у pydantic-settings) — Settings() сконструируется.
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
+os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret-0123456789")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://t:t@localhost:5432/test")
@@ -31,6 +32,7 @@ _stub.render_verbatim = _noop_render  # бронебойный fallback в pipel
 _stub.CACHE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="render_cache_test_"))
 _stub.PREVIEW_DPI = 300
 _stub._trim_white = lambda b, *a, **k: b
+_stub._TEX_SAFE_ENV = {}  # figures.py импортит для env субпроцесса (в тестах не исполняется)
 sys.modules.setdefault("app.render.latex_to_png", _stub)
 
 # Заглушка plain_pdf (free-mode рендер через ReportLab) — в тестах не нужна реально.

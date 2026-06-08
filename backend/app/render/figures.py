@@ -10,6 +10,7 @@ Dockerfile-зависимости: те же что и для latex_to_png — t
 """
 import asyncio
 import hashlib
+import os
 import re
 import subprocess
 import tempfile
@@ -17,7 +18,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from app.render.latex_to_png import CACHE_DIR, PREVIEW_DPI, _trim_white
+from app.ai.latex_sanitize import strip_dangerous_tex
+from app.render.latex_to_png import CACHE_DIR, PREVIEW_DPI, _TEX_SAFE_ENV, _trim_white
 
 # ── Кэш-директория для рисунков (персистентна в контейнере) ─────────────────
 FIGURE_CACHE_DIR = CACHE_DIR / "figures"
@@ -25,6 +27,11 @@ FIGURE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Инкрементировать при изменении STANDALONE_TEMPLATE — инвалидирует кэш.
 FIGURE_TEMPLATE_VERSION = "fig_v3"
+
+# DoS-защита: максимум рисунков на одно решение (лишние молча отбрасываем) и
+# глобальный потолок параллельных компиляций (каждая = отдельный pdflatex-процесс).
+_MAX_FIGURES_PER_DOC = 6
+_FIG_COMPILE_SEM = asyncio.Semaphore(3)
 
 # Регексп для маркеров, которые расставляет модель вокруг TikZ-кода.
 FIG_RE = re.compile(r"%%FIG\s*(.*?)%%ENDFIG", re.DOTALL)
@@ -91,7 +98,8 @@ def _remove_cmd_with_arg(text: str, cmd: str) -> str:
 
 
 def _sanitize_figure_body(body: str) -> str:
-    r"""Снять float-обёртки: \begin{figure}/\end{figure}/\centering/\caption{}/\label{}."""
+    r"""Снять float-обёртки + опасные TeX-примитивы (\input/\write/...) из LLM-TikZ."""
+    body = strip_dangerous_tex(body)  # безопасность: LFI/IO в теле рисунка
     body = re.sub(r"\\begin\{figure\*?\}(\[[^\]]*\])?", "", body)
     body = re.sub(r"\\end\{figure\*?\}", "", body)
     body = re.sub(r"\\centering\b", "", body)
@@ -143,6 +151,7 @@ def _compile_figure_sync(tikz_body: str, out_png: Path) -> bool:
                 encoding="utf-8",
                 errors="replace",
                 timeout=30,
+                env=_TEX_SAFE_ENV,  # openin_any=p — запрет чтения произвольных файлов
             )
         except subprocess.TimeoutExpired:
             logger.error("figures: pdflatex timeout")
@@ -208,7 +217,8 @@ async def compile_figure(tikz_body: str) -> Path | None:
         return out_png
 
     logger.info(f"figures: compile START {h}, {len(tikz_body)} chars")
-    ok = await asyncio.to_thread(_compile_figure_sync, tikz_body, out_png)
+    async with _FIG_COMPILE_SEM:  # потолок параллельных pdflatex-процессов
+        ok = await asyncio.to_thread(_compile_figure_sync, tikz_body, out_png)
     if not ok:
         logger.warning(f"figures: compile FAILED {h}")
         return None
@@ -235,17 +245,23 @@ async def render_figures_in_latex(latex: str) -> tuple[str, int, int]:
     if not matches:
         return latex, 0, 0
 
-    # Компилируем все рисунки параллельно.
-    bodies = [m.group(1) for m in matches]
+    # DoS-cap: компилируем максимум _MAX_FIGURES_PER_DOC блоков; лишние (i >= cap)
+    # просто вырезаем (рисунок опционален) — иначе их сырой TikZ сломал бы рендер.
+    capped = matches[:_MAX_FIGURES_PER_DOC]
+    if len(matches) > _MAX_FIGURES_PER_DOC:
+        logger.warning(f"figures: {len(matches)} блоков > cap {_MAX_FIGURES_PER_DOC} — лишние удалены")
     results: list[Path | None] = await asyncio.gather(
-        *[compile_figure(body) for body in bodies]
+        *[compile_figure(m.group(1)) for m in capped]
     )
 
     n_ok = 0
     n_failed = 0
     # Заменяем справа налево, чтобы смещения не сбивались.
-    for match, png_path in zip(reversed(matches), reversed(results)):
-        if png_path is not None:
+    for i in range(len(matches) - 1, -1, -1):
+        match = matches[i]
+        if i >= _MAX_FIGURES_PER_DOC:
+            replacement = ""  # сверх лимита — убираем блок целиком
+        elif (png_path := results[i]) is not None:
             replacement = (
                 r"\begin{center}"
                 r"\includegraphics"

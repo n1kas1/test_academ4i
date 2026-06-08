@@ -18,6 +18,8 @@ def get_client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            timeout=30.0,      # дефолт SDK 600с — при зависании шлюза копились бы запросы
+            max_retries=1,     # внешний tenacity @retry уже даёт 3 попытки
         )
     return _client
 
