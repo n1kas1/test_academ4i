@@ -35,10 +35,10 @@ from app.ai.deepseek import (
 )
 
 
-# Жёсткий таймаут — должен укладываться в Telegram webhook лимит.
-# Gemini Flash обычно отвечает за 2-15с; 60с с запасом покрывает редкие
-# тяжёлые промпты с большим RAG-контекстом.
-_GEMINI_TIMEOUT_SEC = 60.0
+# Таймаут. Webhook fire-and-forget (200 OK сразу), так что Telegram-лимит не давит —
+# можно ждать длинные решения. 120с покрывает тяжёлые задачи на полном бюджете вывода
+# (16384 ток при ~150-250 ток/с ≈ 65-110с). Большинство задач отвечают за 2-15с.
+_GEMINI_TIMEOUT_SEC = 120.0
 
 # Стоимость в ₽ за 1M токенов (вход / выход). Плейсхолдер — уточнить по дашборду
 # ProxyAPI после первых счётов. Gemini 2.5 Flash дешевле Sonnet, дороже DeepSeek.
@@ -63,12 +63,11 @@ async def _generate(system_prompt: str, user_text: str, *, log_tag: str) -> str:
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": {
-            # ВАЖНО: maxOutputTokens у Gemini 2.5 покрывает thinking + ответ.
-            # Без thinkingBudget=0 модель сжигает 3-4к токенов на reasoning,
-            # на финальный ответ остаются крохи — юзер получает огрызок.
-            # 8192 хватает на длинное доказательство, Gemini Flash без thinking
-            # выдаст это за 30-40с (а не 3 минуты как DeepSeek).
-            "maxOutputTokens": 8192,
+            # maxOutputTokens у Gemini 2.5 покрывает thinking + ответ. thinkingBudget=0
+            # отключает reasoning → весь бюджет на ответ. 8192 ОБРЕЗАЛ длинные тервер/
+            # доказательства на середине (finish=MAX_TOKENS, решение без «Ответа» →
+            # юзер получал огрызок). 16384 даёт довести до конца. Flash поддерживает.
+            "maxOutputTokens": 16384,
             # thinkingBudget=0 → отключить thinking. RAG-контекст у нас уже
             # есть как «подсказка», thinking дополнительной пользы не даёт.
             "thinkingConfig": {"thinkingBudget": 0},
