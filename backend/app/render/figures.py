@@ -26,7 +26,7 @@ FIGURE_CACHE_DIR = CACHE_DIR / "figures"
 FIGURE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Инкрементировать при изменении STANDALONE_TEMPLATE — инвалидирует кэш.
-FIGURE_TEMPLATE_VERSION = "fig_v3"
+FIGURE_TEMPLATE_VERSION = "fig_v4"
 
 # DoS-защита: максимум рисунков на одно решение (лишние молча отбрасываем) и
 # глобальный потолок параллельных компиляций (каждая = отдельный pdflatex-процесс).
@@ -45,7 +45,20 @@ STANDALONE_TEMPLATE = r"""\documentclass[border=4pt]{standalone}
 \usepackage{tikz}
 \usepackage{circuitikz}
 \usepackage{pgfplots}
-\pgfplotsset{compat=1.18}
+% Дефолты для ВСЕХ осей: компактные засечки + мелкий шрифт + нормальный размер —
+% чтобы числа на осях НЕ наезжали (особенно при больших значениях, напр.
+% y=x^4+x^3+34). Явные опции в \begin{axis}[...] это переопределяют.
+\pgfplotsset{
+  compat=1.18,
+  every axis/.append style={
+    width=9.5cm, height=7cm,
+    scaled ticks=true,
+    tick label style={font=\footnotesize},
+    label style={font=\small},
+    grid=both, grid style={gray!18, line width=0.3pt},
+    enlarge x limits=0.05, enlarge y limits=0.08,
+  },
+}
 \usepgfplotslibrary{fillbetween}
 \usetikzlibrary{arrows.meta,positioning,calc,patterns,shapes.geometric,shapes.misc,circuits.logic.IEC,automata,decorations.pathmorphing,intersections,angles,quotes,through,backgrounds}
 \begin{document}
